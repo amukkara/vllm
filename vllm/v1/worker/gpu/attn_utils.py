@@ -467,12 +467,36 @@ def build_attn_metadata(
     # indices, so later groups re-gather those from the first group's metadata.
     # Also at capture, so FULL graphs share the batch-level buffers.
     cached_metadata: dict[tuple[KVCacheSpec, type], Any] = {}
+    # Re-gathers are deferred and run once per reuse key after the loop, so a
+    # builder can update all groups together (one launch instead of one per
+    # group: Qwen3.5 has 30 GDN groups).
+    deferred: dict[
+        tuple[KVCacheSpec, type],
+        list[tuple[AttentionGroup, torch.Tensor, torch.Tensor]],
+    ] = {}
+
+    def reuse_key_of(attn_group: AttentionGroup) -> tuple[KVCacheSpec, type] | None:
+        builder = attn_group.get_metadata_builder(ubatch_idx)
+        if builder.supports_update_block_table and isinstance(
+            attn_group.kv_cache_spec, MambaSpec
+        ):
+            return (attn_group.kv_cache_spec, type(builder))
+        return None
+
     num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
     for i in range(num_kv_cache_groups):
         if not attn_groups[i]:
             continue
         block_table = block_tables[i]
         slot_mapping = slot_mappings[i]
+        reuse_keys = [reuse_key_of(g) for g in attn_groups[i]]
+        if all(k in cached_metadata for k in reuse_keys):
+            # Nothing to build: skip the per-group common metadata.
+            for attn_group, reuse_key in zip(attn_groups[i], reuse_keys):
+                deferred.setdefault(reuse_key, []).append(  # type: ignore[arg-type]
+                    (attn_group, block_table, slot_mapping)
+                )
+            continue
         # Per-group causal for hybrid drafters (mixed SWA/full attention).
         group_causal = (
             causal if isinstance(causal, (bool, torch.Tensor)) else causal.get(i, True)
@@ -517,18 +541,14 @@ def build_attn_metadata(
             **common_attn_metadata_extra_kwargs,
         )
 
-        for attn_group in attn_groups[i]:
+        for attn_group, reuse_key in zip(attn_groups[i], reuse_keys):
             attn_metadata_builder = attn_group.get_metadata_builder(ubatch_idx)
-            reuse_key = None
-            if attn_metadata_builder.supports_update_block_table and isinstance(
-                attn_group.kv_cache_spec, MambaSpec
-            ):
-                reuse_key = (attn_group.kv_cache_spec, type(attn_metadata_builder))
             if reuse_key in cached_metadata:
-                metadata = attn_metadata_builder.update_block_table(
-                    cached_metadata[reuse_key], block_table, slot_mapping
+                deferred.setdefault(reuse_key, []).append(  # type: ignore[arg-type]
+                    (attn_group, block_table, slot_mapping)
                 )
-            elif for_cudagraph_capture:
+                continue
+            if for_cudagraph_capture:
                 metadata = attn_metadata_builder.build_for_cudagraph_capture(
                     common_attn_metadata
                 )
@@ -551,6 +571,18 @@ def build_attn_metadata(
             for layer_name in attn_group.layer_names:
                 attn_metadata[layer_name] = metadata
         token_to_req_indices = common_attn_metadata._token_to_req_indices_cache
+
+    for reuse_key, entries in deferred.items():
+        builders = [g.get_metadata_builder(ubatch_idx) for g, _, _ in entries]
+        metadatas = reuse_key[1].update_block_tables(
+            cached_metadata[reuse_key],
+            builders,
+            [blk_table for _, blk_table, _ in entries],
+            [slot_mapping for _, _, slot_mapping in entries],
+        )
+        for (attn_group, _, _), metadata in zip(entries, metadatas):
+            for layer_name in attn_group.layer_names:
+                attn_metadata[layer_name] = metadata
     return attn_metadata
 
 

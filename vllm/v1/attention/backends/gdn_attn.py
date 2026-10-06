@@ -12,6 +12,7 @@ from vllm.model_executor.layers.mamba.checkpoint import (
     MambaPrefillCheckpointBuilder,
     MambaPrefillCheckpointMetadata,
 )
+from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -658,6 +659,76 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             prefill_state_indices=prefill_indices,
         )
 
+    # (dst ptrs, src ptrs, src strides) -> device pointer/stride tensors.
+    _spec_staging_ptrs: dict[tuple, tuple[torch.Tensor, ...]] = {}
+
+    @classmethod
+    def update_block_tables(  # type: ignore[override]
+        cls,
+        metadata: GDNAttentionMetadata,
+        builders: list["GDNAttentionMetadataBuilder"],  # type: ignore[override]
+        blk_tables: list[torch.Tensor],
+        slot_mappings: list[torch.Tensor],
+    ) -> list[GDNAttentionMetadata]:
+        """Spec-decode steps staged into the FULL graph buffers copy every
+        group's state indices with one kernel; the per-group path costs a mask
+        gather, a copy and a fill per group on the host. Other batches fall
+        back to ``update_block_table``."""
+        m = metadata
+        b0 = builders[0]
+        masks = m.spec_sequence_masks_cpu
+        if (
+            len(builders) == 1
+            or masks is None
+            or b0.vllm_config.cache_config.mamba_cache_mode == "align"
+            or m.spec_state_indices_tensor is None
+            or not b0._stage_spec_decode(
+                m.num_prefills,
+                m.num_decodes,
+                m.num_spec_decodes,
+                m.num_spec_decode_tokens,
+            )
+            # Spec rows must be the leading rows (padding at the back).
+            or not bool(masks[: m.num_spec_decodes].all())
+        ):
+            return super().update_block_tables(m, builders, blk_tables, slot_mappings)
+
+        key = (
+            tuple(b.spec_state_indices_tensor.data_ptr() for b in builders),
+            tuple(t.data_ptr() for t in blk_tables),
+            tuple(t.stride(0) for t in blk_tables),
+        )
+        ptrs = cls._spec_staging_ptrs.get(key)
+        if ptrs is None:
+            assert all(t.dtype == torch.int32 for t in blk_tables)
+            device = blk_tables[0].device
+            ptrs = tuple(
+                torch.tensor(v, dtype=torch.int64, device=device) for v in key
+            )
+            cls._spec_staging_ptrs[key] = ptrs
+        dst_ptrs, src_ptrs, src_strides = ptrs
+
+        batch_size = m.spec_state_indices_tensor.shape[0]
+        width = b0.num_spec + 1
+        _stage_spec_state_indices_kernel[(len(builders), batch_size)](
+            src_ptrs,
+            src_strides,
+            dst_ptrs,
+            m.num_spec_decodes,
+            WIDTH=width,
+            BLOCK=triton.next_power_of_2(width),
+            NULL_ID=NULL_BLOCK_ID,
+        )
+        return [
+            replace(
+                m,
+                spec_state_indices_tensor=b.spec_state_indices_tensor[:batch_size],
+                non_spec_state_indices_tensor=None,
+                prefill_state_indices=None,
+            )
+            for b in builders
+        ]
+
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
     ):
@@ -682,3 +753,28 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         assert num_decode_draft_tokens_cpu.shape == num_accepted_tokens.shape
 
         return self.build(0, m, num_accepted_tokens, num_decode_draft_tokens_cpu)
+
+
+@triton.jit(do_not_specialize=["num_spec_decodes"])
+def _stage_spec_state_indices_kernel(
+    src_ptrs,  # [num_groups] int32 block table base pointers
+    src_strides,  # [num_groups]
+    dst_ptrs,  # [num_groups] spec_state_indices_tensor base pointers
+    num_spec_decodes,
+    WIDTH: tl.constexpr,  # num_spec + 1
+    BLOCK: tl.constexpr,
+    NULL_ID: tl.constexpr,
+):
+    # dst[g][row, :WIDTH] = src[g][row, :WIDTH], NULL_ID for padded rows.
+    group = tl.program_id(0)
+    row = tl.program_id(1)
+    offs = tl.arange(0, BLOCK)
+    mask = offs < WIDTH
+    dst = tl.load(dst_ptrs + group).to(tl.pointer_type(tl.int32)) + row * WIDTH
+    if row < num_spec_decodes:
+        src = tl.load(src_ptrs + group).to(tl.pointer_type(tl.int32))
+        src += row * tl.load(src_strides + group)
+        vals = tl.load(src + offs, mask=mask)
+    else:
+        vals = tl.full([BLOCK], NULL_ID, tl.int32)
+    tl.store(dst + offs, vals, mask=mask)

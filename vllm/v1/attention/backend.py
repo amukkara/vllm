@@ -724,6 +724,23 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
         """
         raise NotImplementedError
 
+    @classmethod
+    def update_block_tables(
+        cls,
+        metadata: M,
+        builders: "list[AttentionMetadataBuilder[M]]",
+        blk_tables: list[torch.Tensor],
+        slot_mappings: list[torch.Tensor],
+    ) -> list[M]:
+        """``update_block_table`` for several groups sharing ``metadata``.
+        Builders may override this to update all groups in one launch."""
+        return [
+            builder.update_block_table(metadata, blk_table, slot_mapping)
+            for builder, blk_table, slot_mapping in zip(
+                builders, blk_tables, slot_mappings
+            )
+        ]
+
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
     ) -> M:
