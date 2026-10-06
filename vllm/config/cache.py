@@ -215,7 +215,7 @@ class CacheConfig:
     mamba_block_size is a multiple of replayssm_buffer_len, but this is not
     required."""
     use_kda_recoverssm: bool = field(default=False, init=False)
-    """Whether Kimi-K3 KDA uses RecoverSSM speculative decode."""
+    """Whether Kimi-K3 KDA or Qwen3.5 GDN uses RecoverSSM speculative decode."""
 
     # Will be set after profiling.
     num_gpu_blocks: int | None = field(default=None, init=False)

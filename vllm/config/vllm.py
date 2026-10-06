@@ -3463,12 +3463,19 @@ class VllmConfig:
             "KimiLinearForCausalLM",
             "KimiK3ForConditionalGeneration",
         )
-        is_kda_model = (
-            self.model_config is not None
-            and self.model_config.architecture in kda_architectures
+        # Qwen3.5 GDN reuses the KDA RecoverSSM kernels (scalar gate).
+        gdn_architectures = (
+            "Qwen3_5ForCausalLM",
+            "Qwen3_5MoeForCausalLM",
+            "Qwen3_5ForConditionalGeneration",
+            "Qwen3_5MoeForConditionalGeneration",
         )
-        self.cache_config.use_kda_recoverssm = (
-            self.num_speculative_tokens > 0 and is_kda_model
+        architecture = (
+            self.model_config.architecture if self.model_config is not None else None
+        )
+        is_gdn_model = architecture in gdn_architectures
+        self.cache_config.use_kda_recoverssm = self.num_speculative_tokens > 0 and (
+            architecture in kda_architectures or is_gdn_model
         )
         use_mamba_replayssm_spec = (
             self.num_speculative_tokens > 0 and not self.cache_config.use_kda_recoverssm
@@ -3497,6 +3504,8 @@ class VllmConfig:
                 raise ValueError(
                     "RecoverSSM supports only none and align Mamba cache modes"
                 )
+            if is_gdn_model and self.cache_config.mamba_cache_mode != "none":
+                raise ValueError("GDN RecoverSSM supports only --mamba-cache-mode none")
             if (
                 self.cache_config.mamba_cache_mode == "align"
                 and not self.use_v2_model_runner

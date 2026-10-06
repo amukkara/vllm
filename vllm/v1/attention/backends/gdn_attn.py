@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Backend for GatedDeltaNet attention."""
 
-from dataclasses import dataclass, replace
-from typing import Literal
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING, Literal
 
 import torch
 
@@ -20,6 +20,10 @@ from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
 )
+from vllm.v1.attention.backends.recoverssm_metadata import (
+    RecoverSSMMetadata,
+    RecoverSSMPostprocessMetadata,
+)
 from vllm.v1.attention.backends.utils import (
     NULL_BLOCK_ID,
     compute_causal_conv1d_metadata,
@@ -27,6 +31,11 @@ from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
 from vllm.v1.kv_cache_interface import MambaSpec
+
+if TYPE_CHECKING:
+    from vllm.models.kimi_k3.nvidia.ops.recoverssm import (
+        KDARecoverSSMCommitContext,
+    )
 
 
 class GDNAttentionBackend(AttentionBackend):
@@ -44,7 +53,7 @@ class GDNAttentionBackend(AttentionBackend):
 
 
 @dataclass
-class GDNAttentionMetadata:
+class GDNAttentionMetadata(RecoverSSMMetadata):
     num_prefills: int
     num_prefill_tokens: int
     num_decodes: int
@@ -86,6 +95,29 @@ class GDNAttentionMetadata:
     batch_ptr: torch.Tensor | None = None
     token_chunk_offset_ptr: torch.Tensor | None = None
 
+    # RecoverSSM: the spec verify pass leaves the checkpoint untouched; after
+    # sampling, this group's commit folds the accepted tokens into it.
+    recoverssm_context: "KDARecoverSSMCommitContext | None" = field(
+        default=None, repr=False, compare=False
+    )
+    # Batch row of each spec decode when spec rows are not the leading rows.
+    recoverssm_request_indices: torch.Tensor | None = None
+
+    def commit_recoverssm_state(
+        self, num_accepted_tokens: torch.Tensor
+    ) -> RecoverSSMPostprocessMetadata | None:
+        if self.recoverssm_context is None:
+            return None
+        assert self.spec_state_indices_tensor is not None
+        assert self.spec_query_start_loc is not None
+        self.recoverssm_context.commit(
+            num_accepted_tokens,
+            self.spec_state_indices_tensor[: self.num_spec_decodes, 0],
+            self.spec_query_start_loc[: self.num_spec_decodes + 1],
+            request_indices=self.recoverssm_request_indices,
+        )
+        return None
+
 
 class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]):
     kv_cache_spec: MambaSpec
@@ -120,6 +152,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             self.num_spec = 0
         self.use_spec_decode: bool = self.num_spec > 0
         self._init_reorder_batch_threshold(1, self.use_spec_decode)
+        # RecoverSSM verifies every draft off the checkpoint slot, so spec
+        # decodes need one state slot instead of one per token.
+        self.use_recoverssm = vllm_config.cache_config.use_kda_recoverssm
+        self.spec_state_slots = 1 if self.use_recoverssm else self.num_spec + 1
+        self.recoverssm_context: KDARecoverSSMCommitContext | None = None
 
         self.use_full_cuda_graph: bool = (
             self.compilation_config.cudagraph_mode.has_full_cudagraphs()
@@ -147,7 +184,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             )
 
         self.spec_state_indices_tensor: torch.Tensor = torch.empty(
-            (self.decode_cudagraph_max_bs, self.num_spec + 1),
+            (self.decode_cudagraph_max_bs, self.spec_state_slots),
             dtype=torch.int32,
             device=device,
         )
@@ -186,6 +223,20 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             dtype=torch.int32,
             device=device,
         )
+
+    def _get_recoverssm_context(self) -> "KDARecoverSSMCommitContext":
+        if self.recoverssm_context is None:
+            from vllm.models.kimi_k3.nvidia.ops.recoverssm import (
+                KDARecoverSSMCommitContext,
+            )
+
+            forward_context = self.vllm_config.compilation_config.static_forward_context
+            self.recoverssm_context = KDARecoverSSMCommitContext.create(
+                [forward_context[layer_name] for layer_name in self.layer_names],
+                spec_query_len=1 + self.num_spec,
+                max_num_reqs=self.vllm_config.scheduler_config.max_num_seqs,
+            )
+        return self.recoverssm_context
 
     def _build_chunk_metadata(
         self,
@@ -254,16 +305,23 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             )
 
         uniform_spec_sequence_length = None
+        recoverssm_request_indices: torch.Tensor | None = None
         spec_sequence_masks_cpu: torch.Tensor | None = None
         if not self.use_spec_decode or num_decode_draft_tokens_cpu is None:
             spec_sequence_masks = None
             num_spec_decodes = 0
         else:
             spec_sequence_masks_cpu = num_decode_draft_tokens_cpu >= 0
+            if self.use_recoverssm and m.is_prefilling is not None:
+                # As in KDA: RecoverSSM keeps the extended conv window, so
+                # draft-less decodes also take the spec path.
+                query_lens_cpu = query_start_loc_cpu.diff()
+                spec_sequence_masks_cpu |= ~m.is_prefilling & (query_lens_cpu > 0)
+                spec_sequence_masks_cpu &= query_lens_cpu <= self.num_spec + 1
             num_spec_decodes = spec_sequence_masks_cpu.sum().item()
-            if (
-                num_spec_decodes == 0
-                or num_decode_draft_tokens_cpu[spec_sequence_masks_cpu].sum().item()
+            if num_spec_decodes == 0 or (
+                not self.use_recoverssm
+                and num_decode_draft_tokens_cpu[spec_sequence_masks_cpu].sum().item()
                 == 0
             ):
                 num_spec_decodes = 0
@@ -364,7 +422,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 )
                 # Filter by spec_sequence_masks to exclude padded sequences
                 spec_state_indices_tensor = block_table_tensor[
-                    spec_sequence_masks_cpu, : self.num_spec + 1
+                    spec_sequence_masks_cpu, : self.spec_state_slots
                 ]
                 non_spec_state_indices_tensor = None
                 # Padded sequences are always at the back, so the first
@@ -380,12 +438,18 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     output_size=query_start_loc_cpu[-1].item(),
                 )
                 index = torch.argsort(spec_token_masks, stable=True)
+                if self.use_recoverssm:
+                    recoverssm_request_indices = async_tensor_h2d(
+                        spec_sequence_masks_cpu.nonzero(as_tuple=True)[0],
+                        dtype=torch.int32,
+                        device=query_start_loc.device,
+                    )
                 num_non_spec_tokens = num_prefill_tokens + num_decode_tokens
                 non_spec_token_indx = index[:num_non_spec_tokens]
                 spec_token_indx = index[num_non_spec_tokens:]
 
                 spec_state_indices_tensor = block_table_tensor[
-                    spec_sequence_masks_cpu, : self.num_spec + 1
+                    spec_sequence_masks_cpu, : self.spec_state_slots
                 ]
                 non_spec_state_indices_tensor = block_table_tensor[
                     non_spec_sequence_masks_cpu, 0
@@ -422,7 +486,14 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 )
 
             assert num_accepted_tokens is not None
-            num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu]
+            if self.use_recoverssm:
+                # The commit already folded the accepted tokens into the
+                # checkpoint and conv window, so each step starts fresh.
+                num_accepted_tokens = torch.ones_like(
+                    num_accepted_tokens[:num_spec_decodes]
+                )
+            else:
+                num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu]
 
         chunk_indices: torch.Tensor | None = None
         chunk_offsets: torch.Tensor | None = None
@@ -579,6 +650,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             nums_dict=nums_dict,
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,
+            recoverssm_context=(
+                self._get_recoverssm_context()
+                if self.use_recoverssm and num_spec_decodes > 0
+                else None
+            ),
+            recoverssm_request_indices=recoverssm_request_indices,
         )
         return attn_metadata
 
@@ -628,7 +705,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             if m.num_prefills > 0:
                 prefill_indices = non_spec_indices[m.num_decodes :]
         else:
-            spec_indices = blk_table[masks, : self.num_spec + 1]
+            spec_indices = blk_table[masks, : self.spec_state_slots]
             if m.num_prefills > 0:
                 non_spec_indices = prefill_indices = blk_table[~masks, 0]
 
@@ -657,6 +734,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             spec_state_indices_tensor=spec_indices,
             non_spec_state_indices_tensor=non_spec_indices,
             prefill_state_indices=prefill_indices,
+            recoverssm_context=(
+                self._get_recoverssm_context()
+                if m.recoverssm_context is not None
+                else None
+            ),
         )
 
     # (dst ptrs, src ptrs, src strides) -> device pointer/stride tensors.
@@ -709,7 +791,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         dst_ptrs, src_ptrs, src_strides = ptrs
 
         batch_size = m.spec_state_indices_tensor.shape[0]
-        width = b0.num_spec + 1
+        width = b0.spec_state_slots
         _stage_spec_state_indices_kernel[(len(builders), batch_size)](
             src_ptrs,
             src_strides,
@@ -719,15 +801,50 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             BLOCK=triton.next_power_of_2(width),
             NULL_ID=NULL_BLOCK_ID,
         )
+        # RecoverSSM: one commit for all these groups (the first carries it),
+        # reading each group's state indices from its staging buffer.
+        recoverssm_context = (
+            cls._get_group_recoverssm_context(builders)
+            if m.recoverssm_context is not None
+            else None
+        )
         return [
             replace(
                 m,
                 spec_state_indices_tensor=b.spec_state_indices_tensor[:batch_size],
                 non_spec_state_indices_tensor=None,
                 prefill_state_indices=None,
+                recoverssm_context=recoverssm_context if i == 0 else None,
             )
-            for b in builders
+            for i, b in enumerate(builders)
         ]
+
+    # builder ids -> RecoverSSM commit context over all their layers.
+    _group_recoverssm_contexts: dict[tuple, "KDARecoverSSMCommitContext"] = {}
+
+    @classmethod
+    def _get_group_recoverssm_context(
+        cls, builders: list["GDNAttentionMetadataBuilder"]
+    ) -> "KDARecoverSSMCommitContext":
+        key = tuple(id(b) for b in builders)
+        context = cls._group_recoverssm_contexts.get(key)
+        if context is None:
+            from vllm.models.kimi_k3.nvidia.ops.recoverssm import (
+                KDARecoverSSMCommitContext,
+            )
+
+            b0 = builders[0]
+            forward_context = b0.vllm_config.compilation_config.static_forward_context
+            context = KDARecoverSSMCommitContext.create(
+                [forward_context[name] for b in builders for name in b.layer_names],
+                spec_query_len=1 + b0.num_spec,
+                max_num_reqs=b0.vllm_config.scheduler_config.max_num_seqs,
+                state_indices=[
+                    b.spec_state_indices_tensor for b in builders for _ in b.layer_names
+                ],
+            )
+            cls._group_recoverssm_contexts[key] = context
+        return context
 
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
@@ -761,7 +878,7 @@ def _stage_spec_state_indices_kernel(
     src_strides,  # [num_groups]
     dst_ptrs,  # [num_groups] spec_state_indices_tensor base pointers
     num_spec_decodes,
-    WIDTH: tl.constexpr,  # num_spec + 1
+    WIDTH: tl.constexpr,  # spec_state_slots
     BLOCK: tl.constexpr,
     NULL_ID: tl.constexpr,
 ):

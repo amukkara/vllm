@@ -381,6 +381,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.head_v_dim,
             self.conv_kernel_size,
             self.num_spec,
+            self.cache_config.use_kda_recoverssm,
         )
 
     def __init__(
@@ -398,6 +399,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.head_k_dim = config.linear_key_head_dim
         self.head_v_dim = config.linear_value_head_dim
         self.conv_kernel_size = config.linear_conv_kernel_dim
+        self.use_recoverssm = self.cache_config.use_kda_recoverssm
+        if self.cache_config.use_replayssm and not self.use_recoverssm:
+            raise ValueError(
+                "GDN supports --use-replayssm only with speculative decoding"
+            )
         self.key_dim = self.head_k_dim * self.num_k_heads
         self.value_dim = self.head_v_dim * self.num_v_heads
         self.gqa_interleaved_layout = gqa_interleaved_layout
@@ -540,7 +546,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     def _fused_gdn_decode_unsupported_reason(
         self, vllm_config: VllmConfig
     ) -> str | None:
-        conv_state_dtype, recurrent_state_dtype = self.get_state_dtype()
+        conv_state_dtype, recurrent_state_dtype = self.get_state_dtype()[:2]
         if (
             self.gqa_interleaved_layout
             or self.head_k_dim != 128
@@ -1085,7 +1091,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         dtype = qkv_or_qkvz.dtype
         num_k_heads = self.num_k_heads // self.tp_size
         num_v_heads = self.num_v_heads // self.tp_size
-        _, state_dtype = self.get_state_dtype()
+        state_dtype = self.get_state_dtype()[1]
 
         # All kernels use BT = chunk_size, so a single pass with T = chunk_size
         # is sufficient to populate every autotuner cache. Mirror the real
@@ -1343,7 +1349,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 ],
                 num_accepted_tokens=num_accepted_tokens,
                 query_start_loc=spec_query_start_loc,
-                max_query_len=spec_state_indices_tensor.size(-1),
+                max_query_len=self.num_spec + 1,
                 validate_data=False,
             )
 
@@ -1443,7 +1449,34 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # 2. Recurrent attention
 
         # 2.1: Process the multi-query part
-        if spec_sequence_masks is not None:
+        if spec_sequence_masks is not None and self.use_recoverssm:
+            from vllm.models.kimi_k3.nvidia.ops.recoverssm import (
+                kda_recoverssm_verify,
+            )
+
+            # Kimi-K3's KDA RecoverSSM verify: reads the checkpoint and stores
+            # per-token records; the commit after sampling updates the state.
+            num_spec_decodes = attn_metadata.num_spec_decodes
+            core_attn_out_spec = kda_recoverssm_verify(
+                q=query_spec,
+                k=key_spec,
+                v=value_spec,
+                raw_g=a_spec.unsqueeze(0),
+                raw_beta=b_spec.unsqueeze(0),
+                A_log=self.A_log,
+                dt_bias=self.dt_bias,
+                lower_bound=None,
+                checkpoint_state=ssm_state,
+                correction_cache=self_kv_cache[2],
+                kg_cache=self_kv_cache[3],
+                query_start_loc=spec_query_start_loc[: num_spec_decodes + 1],  # type: ignore[index]
+                state_indices=spec_state_indices_tensor[:num_spec_decodes, 0],  # type: ignore[index]
+                spec_query_len=self.num_spec + 1,
+                # Serial over the window, so latency-bound: see
+                # fused_sigmoid_gating_delta_rule_update.
+                block_v=16,
+            )
+        elif spec_sequence_masks is not None:
             core_attn_out_spec, last_recurrent_state = (
                 fused_sigmoid_gating_delta_rule_update(
                     A_log=self.A_log,
@@ -1808,6 +1841,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and self.num_v_heads % self.num_k_heads == 0
             and self.num_v_heads // self.num_k_heads in (1, 2, 3, 4, 8)
             and state_indices is not None
+            and not self.use_recoverssm
             and state_indices.size(1) <= MAX_FUSED_GDN_MTP_TOKENS
             and hasattr(torch.ops._C, "fused_gdn_decode_post_conv_mtp")
         )

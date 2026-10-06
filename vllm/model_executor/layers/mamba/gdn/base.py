@@ -55,4 +55,5 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             self.model_config.dtype,
             self.cache_config.mamba_cache_dtype,
             self.cache_config.mamba_ssm_cache_dtype,
+            self.cache_config.use_kda_recoverssm,
         )

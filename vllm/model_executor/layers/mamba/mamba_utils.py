@@ -124,10 +124,14 @@ class MambaStateDtypeCalculator:
         model_dtype: ModelDType | torch.dtype,
         mamba_cache_dtype: MambaDType,
         mamba_ssm_cache_dtype: MambaDType = "auto",
-    ) -> tuple[torch.dtype, torch.dtype]:
-        return cls._mamba_state_dtype(
+        use_recoverssm: bool = False,
+    ) -> tuple[torch.dtype, ...]:
+        dtypes = cls._mamba_state_dtype(
             model_dtype, mamba_cache_dtype, mamba_ssm_cache_dtype
         )
+        if use_recoverssm:
+            return cls.append_kda_recoverssm_record(dtypes, model_dtype)
+        return dtypes
 
     @classmethod
     def kda_state_dtype(
@@ -286,6 +290,7 @@ class MambaStateShapeCalculator:
         head_v_dim: int,
         conv_kernel_size: int,
         num_spec: int = 0,
+        use_recoverssm: bool = False,
     ):
         conv_dim = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads
         conv_state_shape = cls._orient_conv_shape(
@@ -298,6 +303,16 @@ class MambaStateShapeCalculator:
             head_v_dim,
             head_k_dim,
         )
+        if use_recoverssm:
+            # The KDA records hold k and the gate in one [2 * head_dim] row.
+            assert head_k_dim == head_v_dim
+            return cls.append_kda_recoverssm_record(
+                (conv_state_shape, temporal_state_shape),
+                num_v_heads,
+                head_v_dim,
+                tp_world_size=tp_world_size,
+                spec_query_len=1 + num_spec,
+            )
         return conv_state_shape, temporal_state_shape
 
     @classmethod
