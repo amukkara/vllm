@@ -1472,9 +1472,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 query_start_loc=spec_query_start_loc[: num_spec_decodes + 1],  # type: ignore[index]
                 state_indices=spec_state_indices_tensor[:num_spec_decodes, 0],  # type: ignore[index]
                 spec_query_len=self.num_spec + 1,
-                # Serial over the window, so latency-bound: see
-                # fused_sigmoid_gating_delta_rule_update.
-                block_v=16,
+                # Serial over the window, so latency-bound: small batches need
+                # narrow V blocks for enough CTAs (GB300, 32-token windows:
+                # BV=8 best up to batch 8, BV=32 from batch 16).
+                block_v=8 if num_spec_decodes <= 8 else 32,
             )
         elif spec_sequence_masks is not None:
             core_attn_out_spec, last_recurrent_state = (

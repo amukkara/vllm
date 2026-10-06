@@ -33,33 +33,6 @@ def _kda_gate(
 
 
 @triton.jit
-def _kda_recurrent_step(
-    state,
-    k,
-    v,
-    raw_g,
-    raw_beta,
-    dt_bias,
-    A,
-    lower_bound,
-    USE_LOWER_BOUND: tl.constexpr,
-):
-    normalized_k = k * tl.rsqrt(tl.sum(k * k) + 1e-6)
-    gate = _kda_gate(
-        raw_g,
-        dt_bias,
-        A,
-        lower_bound,
-        USE_LOWER_BOUND,
-    )
-
-    state *= tl.exp(gate)[None, :]
-    correction = v - tl.sum(state * normalized_k[None, :], axis=1)
-    correction *= tl.sigmoid(raw_beta)
-    return state + correction[:, None] * normalized_k[None, :], correction
-
-
-@triton.jit
 def _kda_recoverssm_verify_kernel(
     q_ptr,
     k_ptr,
@@ -143,101 +116,82 @@ def _kda_recoverssm_verify_kernel(
     )
     state = tl.load(state_ptrs, mask=mask_state, other=0.0).to(tl.float32)
     A = tl.exp(tl.load(A_log_ptr + pid_h).to(tl.float32))
+    if SCALAR_GATE:
+        dt_bias = tl.load(dt_bias_ptr + pid_h).to(tl.float32)
+    else:
+        dt_bias = tl.load(dt_bias_ptr + pid_h * K + offs_k, mask=mask_k, other=0.0).to(
+            tl.float32
+        )
+    correction_ptr = (
+        correction_cache_ptr
+        + state_idx * stride_correction_block
+        + pid_h * stride_correction_head
+        + offs_v * stride_correction_dim
+    )
+    kg_ptr = kg_cache_ptr + state_idx * stride_kg_block + pid_h * stride_kg_head
 
-    for token_offset in tl.static_range(SPEC_QUERY_LEN):
-        token_valid = token_offset < query_len
+    # The recurrence is serial over the window, so only the request's real
+    # tokens are visited (a runtime loop; no masked padding steps).
+    for token_offset in range(0, tl.minimum(query_len, SPEC_QUERY_LEN)):
         token = bos + token_offset
         q = tl.load(
             q_ptr + token * stride_q_token + pid_qk * K + offs_k,
-            mask=token_valid & mask_k,
+            mask=mask_k,
             other=0.0,
         ).to(tl.float32)
         k = tl.load(
             k_ptr + token * stride_k_token + pid_qk * K + offs_k,
-            mask=token_valid & mask_k,
+            mask=mask_k,
             other=0.0,
         ).to(tl.float32)
         v = tl.load(
             v_ptr + token * stride_v_token + pid_h * V + offs_v,
-            mask=token_valid & mask_v,
+            mask=mask_v,
             other=0.0,
         ).to(tl.float32)
+        raw_beta = tl.load(raw_beta_ptr + token * stride_beta_token + pid_h).to(
+            tl.float32
+        )
+        q *= tl.rsqrt(tl.sum(q * q) + 1e-6) * (K**-0.5)
+        normalized_k = k * tl.rsqrt(tl.sum(k * k) + 1e-6)
         if SCALAR_GATE:
-            # GDN: one gate per head, broadcast over K so the records and the
-            # commit kernel match KDA's per-channel gate layout.
-            raw_g = tl.load(
-                raw_g_ptr + token * stride_g_token + pid_h,
-                mask=token_valid,
-                other=0.0,
-            ).to(tl.float32) + tl.zeros([BK], dtype=tl.float32)
+            # GDN: one gate per head, a scalar decay of the whole state.
+            raw_g = tl.load(raw_g_ptr + token * stride_g_token + pid_h).to(
+                tl.float32
+            )
+            gate = _kda_gate(raw_g, dt_bias, A, lower_bound, USE_LOWER_BOUND)
+            state *= tl.exp(gate)
+            # Broadcast over K so the records match KDA's per-channel layout
+            # and the KDA commit kernel applies as is.
+            raw_g = raw_g + tl.zeros([BK], dtype=tl.float32)
         else:
             raw_g = tl.load(
                 raw_g_ptr + token * stride_g_token + pid_h * K + offs_k,
-                mask=token_valid & mask_k,
+                mask=mask_k,
                 other=0.0,
             ).to(tl.float32)
-        raw_beta = tl.load(
-            raw_beta_ptr + token * stride_beta_token + pid_h,
-            mask=token_valid,
-            other=0.0,
-        ).to(tl.float32)
-
-        q *= tl.rsqrt(tl.sum(q * q) + 1e-6) * (K**-0.5)
-        if SCALAR_GATE:
-            dt_bias = tl.load(dt_bias_ptr + pid_h).to(tl.float32) + tl.zeros(
-                [BK], dtype=tl.float32
-            )
-        else:
-            dt_bias = tl.load(
-                dt_bias_ptr + pid_h * K + offs_k, mask=mask_k, other=0.0
-            ).to(tl.float32)
-        updated_state, correction = _kda_recurrent_step(
-            state,
-            k,
-            v,
-            raw_g,
-            raw_beta,
-            dt_bias,
-            A,
-            lower_bound,
-            USE_LOWER_BOUND,
-        )
-        state = tl.where(token_valid, updated_state, state)
+            gate = _kda_gate(raw_g, dt_bias, A, lower_bound, USE_LOWER_BOUND)
+            state *= tl.exp(gate)[None, :]
+        correction = v - tl.sum(state * normalized_k[None, :], axis=1)
+        correction *= tl.sigmoid(raw_beta)
+        state += correction[:, None] * normalized_k[None, :]
 
         out = tl.sum(state * q[None, :], axis=1)
         tl.store(
             out_ptr + token * stride_out_token + pid_h * V + offs_v,
             out,
-            mask=token_valid & mask_v,
-        )
-
-        correction_ptr = (
-            correction_cache_ptr
-            + state_idx * stride_correction_block
-            + pid_h * stride_correction_head
-            + token_offset * stride_correction_pos
+            mask=mask_v,
         )
         tl.store(
-            correction_ptr + offs_v * stride_correction_dim,
+            correction_ptr + token_offset * stride_correction_pos,
             correction,
-            mask=token_valid & mask_v,
+            mask=mask_v,
         )
         if pid_v == 0:
-            kg_ptr = (
-                kg_cache_ptr
-                + state_idx * stride_kg_block
-                + pid_h * stride_kg_head
-                + token_offset * stride_kg_pos
-            )
+            kg_token_ptr = kg_ptr + token_offset * stride_kg_pos
+            tl.store(kg_token_ptr + offs_k * stride_kg_dim, k, mask=mask_k)
             tl.store(
-                kg_ptr + offs_k * stride_kg_dim,
-                k,
-                mask=token_valid & mask_k,
-            )
-            tl.store(
-                kg_ptr + (K + offs_k) * stride_kg_dim,
-                raw_g,
-                mask=token_valid & mask_k,
+                kg_token_ptr + (K + offs_k) * stride_kg_dim, raw_g, mask=mask_k
             )
 
 
@@ -983,8 +937,14 @@ class KDARecoverSSMCommitContext:
         block_table: torch.Tensor | None = None,
         num_computed_tokens: torch.Tensor | None = None,
         mamba_block_size: int | None = None,
+        state_indices_addrs: torch.Tensor | None = None,
     ) -> None:
-        """Fold accepted KDA and convolution inputs into every layer."""
+        """Fold accepted KDA and convolution inputs into every layer.
+
+        ``state_indices_addrs`` overrides the per-layer state-index buffers
+        for this call (same row stride as ``state_indices``)."""
+        if state_indices_addrs is None:
+            state_indices_addrs = self.state_indices_addrs
         batch = state_indices.shape[0]
         if batch == 0:
             return
@@ -1005,7 +965,7 @@ class KDARecoverSSMCommitContext:
             )
         if block_table is not None and block_table.ndim != 2:
             raise ValueError("KDA RecoverSSM block table must be two-dimensional")
-        if self.state_indices_addrs is not None and block_table is not None:
+        if state_indices_addrs is not None and block_table is not None:
             raise ValueError("KDA RecoverSSM per-layer state indices need no align")
         device = self.checkpoints[0].device
         if (
@@ -1065,7 +1025,7 @@ class KDARecoverSSMCommitContext:
             self.conv_state_dim_strides,
             self.conv_state_token_strides,
             state_indices,
-            self.state_indices_addrs,
+            state_indices_addrs,
             self.commit_lens,
             self.final_state_indices,
             self.boundary_state_indices,
@@ -1102,7 +1062,7 @@ class KDARecoverSSMCommitContext:
             self.A_log,
             self.dt_bias,
             state_indices,
-            self.state_indices_addrs,
+            state_indices_addrs,
             self.commit_lens,
             self.final_state_indices,
             self.boundary_state_indices,

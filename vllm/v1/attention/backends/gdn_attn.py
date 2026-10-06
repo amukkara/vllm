@@ -102,6 +102,9 @@ class GDNAttentionMetadata(RecoverSSMMetadata):
     )
     # Batch row of each spec decode when spec rows are not the leading rows.
     recoverssm_request_indices: torch.Tensor | None = None
+    # Per-layer state-index buffer addresses for this step's commit, when the
+    # context's persistent ones (the FULL graph staging buffers) don't apply.
+    recoverssm_state_indices_addrs: torch.Tensor | None = None
 
     def commit_recoverssm_state(
         self, num_accepted_tokens: torch.Tensor
@@ -115,6 +118,7 @@ class GDNAttentionMetadata(RecoverSSMMetadata):
             self.spec_state_indices_tensor[: self.num_spec_decodes, 0],
             self.spec_query_start_loc[: self.num_spec_decodes + 1],
             request_indices=self.recoverssm_request_indices,
+            state_indices_addrs=self.recoverssm_state_indices_addrs,
         )
         return None
 
@@ -773,7 +777,31 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             # Spec rows must be the leading rows (padding at the back).
             or not bool(masks[: m.num_spec_decodes].all())
         ):
-            return super().update_block_tables(m, builders, blk_tables, slot_mappings)
+            metadatas = super().update_block_tables(
+                m, builders, blk_tables, slot_mappings
+            )
+            if m.recoverssm_context is None or len(builders) == 1:
+                return metadatas
+            # RecoverSSM (e.g. mixed prefill/decode steps): still one commit
+            # for all groups, reading this step's per-group index tensors.
+            addrs = async_tensor_h2d(
+                [
+                    md.spec_state_indices_tensor.data_ptr()  # type: ignore[union-attr]
+                    for b, md in zip(builders, metadatas)
+                    for _ in b.layer_names
+                ],
+                dtype=torch.int64,
+                device=blk_tables[0].device,
+            )
+            context = cls._get_group_recoverssm_context(builders)
+            return [
+                replace(
+                    md,
+                    recoverssm_context=context if i == 0 else None,
+                    recoverssm_state_indices_addrs=addrs if i == 0 else None,
+                )
+                for i, md in enumerate(metadatas)
+            ]
 
         key = (
             tuple(b.spec_state_indices_tensor.data_ptr() for b in builders),
