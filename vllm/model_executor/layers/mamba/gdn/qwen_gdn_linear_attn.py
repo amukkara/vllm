@@ -1386,7 +1386,29 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         else:
             mixed_qkv_non_spec = None
 
-        query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
+        if self.use_recoverssm and mixed_qkv_spec is not None:
+            # The RecoverSSM verify takes token strides, so q/k/v can stay
+            # strided views of the packed conv output (no copies).
+            seq_len = mixed_qkv_spec.shape[0]
+            query_spec, key_spec, value_spec = (
+                part.view(1, seq_len, -1, head_dim)
+                for part, head_dim in zip(
+                    torch.split(
+                        mixed_qkv_spec,
+                        [
+                            self.key_dim // self.tp_size,
+                            self.key_dim // self.tp_size,
+                            self.value_dim // self.tp_size,
+                        ],
+                        dim=-1,
+                    ),
+                    (self.head_k_dim, self.head_k_dim, self.head_v_dim),
+                )
+            )
+        else:
+            query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(
+                mixed_qkv_spec
+            )
 
         # Split mixed non-spec-decode+prefill to process independently
         split_non_spec = (
