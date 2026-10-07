@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from typing import Any
 
 import numpy as np
@@ -176,6 +176,44 @@ def _synthetic_denoise_kernel(
         tl.store(num_sampled_ptr + batch_idx, 0)
 
 
+def vocab_parallel_top1(
+    local_logits: torch.Tensor,
+    tp_rank: int,
+    tp_size: int,
+    vocab_size: int,
+    all_gather: Callable[[torch.Tensor], torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Greedy token and its logit per row from vocab-parallel logits.
+
+    Same result as argmax / max over the all-gathered full-vocab logits (ties
+    go to the lowest token id), but each rank reduces its own shard and only
+    one (logit, token id) pair per row and rank is gathered.
+
+    local_logits: [rows, vocab_per_rank], this rank's equal-size shard of the
+    padded vocab. all_gather concatenates [rows, 2] along the last dim in
+    rank order. Returns (token ids [rows] int64, logits [rows] float32).
+    """
+    shard = local_logits.shape[-1]
+    vocab_start = tp_rank * shard
+    num_valid = min(max(vocab_size - vocab_start, 0), shard)
+    if num_valid < shard:
+        # Vocab padding at the end of the last shard(s) is not a token.
+        local_logits = local_logits.clone()
+        local_logits[:, num_valid:] = float("-inf")
+    values, indices = local_logits.max(dim=-1)
+    values = values.float()
+    token_ids = indices + vocab_start
+    if tp_size == 1:
+        return token_ids, values
+    # fp32 holds token ids exactly (vocab < 2**24). The first rank holding
+    # the max wins, i.e. the lowest token id, as argmax over the full row.
+    pairs = all_gather(torch.stack([values, token_ids.float()], dim=-1))
+    pairs = pairs.view(-1, tp_size, 2)
+    best_rank = pairs[:, :, 0].argmax(dim=-1, keepdim=True)
+    best = pairs.gather(1, best_rank.unsqueeze(-1).expand(-1, 1, 2)).squeeze(1)
+    return best[:, 1].to(torch.int64), best[:, 0]
+
+
 class RejectionSampler:
     def __init__(
         self,
@@ -216,6 +254,58 @@ class RejectionSampler:
             self.denoise_step = torch.zeros(
                 max_num_reqs, dtype=torch.int32, device=device
             )
+
+    def sample_greedy_top1(
+        self,
+        top_tokens: torch.Tensor,
+        top_logits: torch.Tensor,
+        input_batch: InputBatch,
+    ) -> SamplerOutput:
+        """Simulated block diffusion (synthetic_denoise_steps), greedy.
+
+        top_tokens / top_logits: the greedy token and its logit (the
+        confidence) for every logits row. A commit pass emits the greedy
+        token of every window position; denoising passes emit nothing.
+        """
+        assert self.synthetic_denoise_steps is not None
+        num_reqs = input_batch.num_reqs
+        cu_num_logits = input_batch.cu_num_logits[: num_reqs + 1]
+        # Logits row -> batch row, without a host sync.
+        rows = torch.searchsorted(
+            cu_num_logits[1:],
+            torch.arange(top_tokens.shape[0], device=top_tokens.device),
+            right=True,
+        )
+        sampled = top_tokens.new_zeros(num_reqs, self.num_speculative_steps + 1)
+        sampled[rows, input_batch.expanded_local_pos[: top_tokens.shape[0]]] = (
+            top_tokens
+        )
+        # Kept for inspection; the simulated decoder does not use it.
+        self.last_confidence = top_logits
+        num_sampled = (cu_num_logits[1:] - cu_num_logits[:-1]).to(torch.int32)
+        _synthetic_denoise_kernel[(num_reqs,)](
+            num_sampled,
+            input_batch.seq_lens,
+            input_batch.cu_num_logits,
+            input_batch.idx_mapping,
+            self.block_seq_len,
+            self.denoise_step,
+            NUM_DENOISE_STEPS=self.synthetic_denoise_steps,
+        )
+        num_sampled, num_rejected = get_num_sampled_and_rejected(
+            num_sampled,
+            input_batch.seq_lens,
+            input_batch.cu_num_logits,
+            input_batch.idx_mapping,
+            self.sampler.req_states.prefill_len.gpu,
+        )
+        return SamplerOutput(
+            sampled_token_ids=sampled,
+            logprobs_tensors=None,
+            num_nans=None,
+            num_sampled=num_sampled,
+            num_rejected=num_rejected,
+        )
 
     def _get_logprobs_tensors(
         self,

@@ -38,7 +38,13 @@ from vllm.distributed.aux_output_connector.worker import (
     AuxOutputWorkerConnector,
     get_aux_output_connector,
 )
-from vllm.distributed.parallel_state import get_dcp_group, get_pp_group
+from vllm.distributed.communication_op import tensor_model_parallel_all_gather
+from vllm.distributed.parallel_state import (
+    get_dcp_group,
+    get_pp_group,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
@@ -159,6 +165,7 @@ from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
 )
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
     RejectionSampler,
+    vocab_parallel_top1,
     get_max_chunk_logits,
 )
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
@@ -1557,6 +1564,36 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         input_batch: InputBatch,
         grammar_output: GrammarOutput | None,
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.synthetic_denoise_steps is not None
+            and input_batch.num_reqs > 0
+            # Structured outputs (only exercised by the kernel warmup here)
+            # and batch-sharded sampling take the regular path.
+            and grammar_output is None
+            and self.batch_sharder is None
+        ):
+            # Simulated block diffusion, greedy: reduce each vocab shard to
+            # its top-1 token and logit instead of gathering full-vocab logits.
+            assert self.rejection_sampler is not None
+            top_tokens, top_logits = vocab_parallel_top1(
+                self.model.compute_logits_local(
+                    hidden_states[input_batch.logits_indices]
+                ),
+                get_tensor_model_parallel_rank(),
+                get_tensor_model_parallel_world_size(),
+                self.vocab_size,
+                lambda t: tensor_model_parallel_all_gather(t, dim=-1),
+            )
+            sampler_output = self.rejection_sampler.sample_greedy_top1(
+                top_tokens, top_logits, input_batch
+            )
+            return (
+                sampler_output,
+                sampler_output.num_sampled,
+                sampler_output.num_rejected,
+            )
+
         shard_metadata = None
         global_input_batch = input_batch
         if self.batch_sharder is not None:
