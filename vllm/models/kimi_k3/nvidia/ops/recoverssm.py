@@ -195,6 +195,184 @@ def _kda_recoverssm_verify_kernel(
             )
 
 
+@triton.jit
+def _gdn_recoverssm_chunk_verify_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    raw_g_ptr,
+    raw_beta_ptr,
+    A_log_ptr,
+    dt_bias_ptr,
+    state_ptr,
+    correction_cache_ptr,
+    kg_cache_ptr,
+    out_ptr,
+    query_start_loc_ptr,
+    state_indices_ptr,
+    lower_bound,
+    null_block_id,
+    stride_q_token,
+    stride_k_token,
+    stride_v_token,
+    stride_g_token,
+    stride_beta_token,
+    stride_state_block,
+    stride_state_head,
+    stride_state_v,
+    stride_state_k,
+    stride_correction_block,
+    stride_correction_head,
+    stride_correction_pos,
+    stride_correction_dim,
+    stride_kg_block,
+    stride_kg_head,
+    stride_kg_pos,
+    stride_kg_dim,
+    stride_out_token,
+    stride_query_start_loc,
+    stride_state_indices,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    BT: tl.constexpr,
+    USE_LOWER_BOUND: tl.constexpr,
+    HEADS_PER_QK_HEAD: tl.constexpr,
+    DOT_PRECISION: tl.constexpr,
+):
+    """GDN (scalar gate) verify of a whole window at once, in chunk form.
+
+    With G = cumsum(g), k^ and q^ the normalized keys/queries and S0 the
+    checkpoint ([V, K]), the recurrence's per-token corrections C (the
+    records the commit replays) and outputs O are
+        (I + A) C = beta * V - (beta * exp(G)) * (K^ S0^T),
+        A[t, j] = beta_t exp(G_t - G_j) k^_t . k^_j            (j < t)
+        O = exp(G) * (Q^ S0^T) + (exp(G_t - G_j) q^_t . k^_j)_{j <= t} C
+    so only the BT x BT triangular solve is serial over tokens.
+    """
+    pid_v = tl.program_id(0)
+    pid_b = tl.program_id(1)
+    pid_h = tl.program_id(2)
+    pid_qk = pid_h // HEADS_PER_QK_HEAD
+
+    bos = tl.load(query_start_loc_ptr + pid_b * stride_query_start_loc).to(tl.int64)
+    eos = tl.load(query_start_loc_ptr + (pid_b + 1) * stride_query_start_loc).to(
+        tl.int64
+    )
+    query_len = eos - bos
+    state_idx = tl.load(state_indices_ptr + pid_b * stride_state_indices).to(tl.int64)
+
+    offs_t = tl.arange(0, BT)
+    offs_k = tl.arange(0, BK)
+    offs_v = pid_v * BV + tl.arange(0, BV)
+    mask_t = offs_t < query_len
+    mask_k = offs_k < K
+    mask_v = offs_v < V
+    tokens = bos + offs_t
+    out_ptrs = out_ptr + tokens[:, None] * stride_out_token + pid_h * V + offs_v[None, :]
+    mask_tv = mask_t[:, None] & mask_v[None, :]
+    if state_idx <= null_block_id:
+        tl.store(out_ptrs, tl.zeros([BT, BV], dtype=tl.float32), mask=mask_tv)
+        return
+
+    mask_tk = mask_t[:, None] & mask_k[None, :]
+    q = tl.load(
+        q_ptr + tokens[:, None] * stride_q_token + pid_qk * K + offs_k[None, :],
+        mask=mask_tk,
+        other=0.0,
+    ).to(tl.float32)
+    k = tl.load(
+        k_ptr + tokens[:, None] * stride_k_token + pid_qk * K + offs_k[None, :],
+        mask=mask_tk,
+        other=0.0,
+    ).to(tl.float32)
+    v = tl.load(
+        v_ptr + tokens[:, None] * stride_v_token + pid_h * V + offs_v[None, :],
+        mask=mask_tv,
+        other=0.0,
+    ).to(tl.float32)
+    raw_g = tl.load(
+        raw_g_ptr + tokens * stride_g_token + pid_h, mask=mask_t, other=0.0
+    ).to(tl.float32)
+    raw_beta = tl.load(
+        raw_beta_ptr + tokens * stride_beta_token + pid_h, mask=mask_t, other=0.0
+    ).to(tl.float32)
+    A = tl.exp(tl.load(A_log_ptr + pid_h).to(tl.float32))
+    dt_bias = tl.load(dt_bias_ptr + pid_h).to(tl.float32)
+    g = tl.where(
+        mask_t, _kda_gate(raw_g, dt_bias, A, lower_bound, USE_LOWER_BOUND), 0.0
+    )
+    beta = tl.where(mask_t, tl.sigmoid(raw_beta), 0.0)
+    G = tl.cumsum(g, axis=0)
+    q_hat = q * (tl.rsqrt(tl.sum(q * q, axis=1) + 1e-6) * (K**-0.5))[:, None]
+    k_hat = k * tl.rsqrt(tl.sum(k * k, axis=1) + 1e-6)[:, None]
+
+    state = tl.load(
+        state_ptr
+        + state_idx * stride_state_block
+        + pid_h * stride_state_head
+        + offs_v[:, None] * stride_state_v
+        + offs_k[None, :] * stride_state_k,
+        mask=mask_v[:, None] & mask_k[None, :],
+        other=0.0,
+    ).to(tl.float32)
+
+    # exp(G_t - G_j) on and below the diagonal (G is non-increasing).
+    lower = offs_t[:, None] >= offs_t[None, :]
+    decay = tl.where(lower, tl.exp(tl.where(lower, G[:, None] - G[None, :], 0.0)), 0.0)
+    strict = offs_t[:, None] > offs_t[None, :]
+    a_mat = tl.where(
+        strict,
+        beta[:, None]
+        * decay
+        * tl.dot(k_hat, tl.trans(k_hat), input_precision=DOT_PRECISION),
+        0.0,
+    )
+    # (I + A)^-1 by forward substitution: row i = e_i - A[i, :] @ inv.
+    inv = tl.where(offs_t[:, None] == offs_t[None, :], 1.0, 0.0)
+    for i in tl.static_range(1, BT):
+        a_row = tl.sum(tl.where(offs_t[:, None] == i, a_mat, 0.0), axis=0)
+        row = tl.sum(a_row[:, None] * inv, axis=0)
+        inv = tl.where(offs_t[:, None] == i, inv - row[None, :], inv)
+
+    k_state = tl.dot(k_hat, tl.trans(state), input_precision=DOT_PRECISION)
+    rhs = beta[:, None] * v - (beta * tl.exp(G))[:, None] * k_state
+    correction = tl.dot(inv, rhs, input_precision=DOT_PRECISION)
+
+    q_state = tl.dot(q_hat, tl.trans(state), input_precision=DOT_PRECISION)
+    qk = decay * tl.dot(q_hat, tl.trans(k_hat), input_precision=DOT_PRECISION)
+    out = tl.exp(G)[:, None] * q_state + tl.dot(
+        qk, correction, input_precision=DOT_PRECISION
+    )
+    tl.store(out_ptrs, out, mask=mask_tv)
+
+    tl.store(
+        correction_cache_ptr
+        + state_idx * stride_correction_block
+        + pid_h * stride_correction_head
+        + offs_t[:, None] * stride_correction_pos
+        + offs_v[None, :] * stride_correction_dim,
+        correction,
+        mask=mask_tv,
+    )
+    if pid_v == 0:
+        kg_ptrs = (
+            kg_cache_ptr
+            + state_idx * stride_kg_block
+            + pid_h * stride_kg_head
+            + offs_t[:, None] * stride_kg_pos
+            + offs_k[None, :] * stride_kg_dim
+        )
+        tl.store(kg_ptrs, k, mask=mask_tk)
+        # Per-head gate broadcast over K, as in the recurrent verify.
+        tl.store(
+            kg_ptrs + K * stride_kg_dim,
+            raw_g[:, None] + tl.zeros([BT, BK], dtype=tl.float32),
+            mask=mask_tk,
+        )
+
+
 @triton.heuristics(
     {
         "HAS_REQUEST_INDICES": lambda args: args["request_indices_ptr"] is not None,
@@ -594,11 +772,14 @@ def kda_recoverssm_verify(
     spec_query_len: int,
     out: torch.Tensor | None = None,
     block_v: int = 32,
+    chunked: bool = False,
+    dot_precision: str = "tf32",
 ) -> torch.Tensor:
     """Verify a KDA speculative window without modifying its checkpoint.
 
     Also serves GDN: q/k may have fewer heads than v (GQA), and ``raw_g`` and
-    ``dt_bias`` may hold one gate per head instead of one per key channel."""
+    ``dt_bias`` may hold one gate per head instead of one per key channel.
+    ``chunked`` (GDN only) verifies the whole window in chunk form."""
     if q.ndim != 4 or q.shape[0] != 1:
         raise ValueError("KDA RecoverSSM q must have shape [1, tokens, heads, dim]")
     _, total_tokens, num_qk_heads, key_dim = q.shape
@@ -689,7 +870,28 @@ def kda_recoverssm_verify(
     block_k = triton.next_power_of_2(key_dim)
     block_v = min(triton.next_power_of_2(value_dim), block_v)
     grid = (triton.cdiv(value_dim, block_v), batch, num_heads)
-    _kda_recoverssm_verify_kernel[grid](
+    if chunked:
+        if not scalar_gate:
+            raise ValueError("Chunked RecoverSSM verify needs a per-head gate")
+        block_t = max(triton.next_power_of_2(spec_query_len), 16)
+        if block_v < 16:
+            raise ValueError("Chunked RecoverSSM verify needs block_v >= 16")
+        kernel = _gdn_recoverssm_chunk_verify_kernel
+        meta = dict(
+            BT=block_t,
+            DOT_PRECISION=dot_precision,
+            num_warps=4,
+            num_stages=1,
+        )
+    else:
+        kernel = _kda_recoverssm_verify_kernel
+        meta = dict(
+            SPEC_QUERY_LEN=spec_query_len,
+            SCALAR_GATE=scalar_gate,
+            num_warps=4,
+            num_stages=2,
+        )
+    kernel[grid](
         q,
         k,
         v,
@@ -729,12 +931,9 @@ def kda_recoverssm_verify(
         V=value_dim,
         BK=block_k,
         BV=block_v,
-        SPEC_QUERY_LEN=spec_query_len,
         USE_LOWER_BOUND=lower_bound is not None,
         HEADS_PER_QK_HEAD=num_heads // num_qk_heads,
-        SCALAR_GATE=scalar_gate,
-        num_warps=4,
-        num_stages=2,
+        **meta,
     )
     return out
 

@@ -1456,6 +1456,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
             # Kimi-K3's KDA RecoverSSM verify: reads the checkpoint and stores
             # per-token records; the commit after sampling updates the state.
+            # GDN runs it in chunk form (tensor-core dots over the whole
+            # window, TF32): on GB300 with 32-token windows BV=64 is fastest
+            # at every batch size, 2.5-3.4x faster than the recurrent form.
             num_spec_decodes = attn_metadata.num_spec_decodes
             core_attn_out_spec = kda_recoverssm_verify(
                 q=query_spec,
@@ -1472,10 +1475,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 query_start_loc=spec_query_start_loc[: num_spec_decodes + 1],  # type: ignore[index]
                 state_indices=spec_state_indices_tensor[:num_spec_decodes, 0],  # type: ignore[index]
                 spec_query_len=self.num_spec + 1,
-                # Serial over the window, so latency-bound: small batches need
-                # narrow V blocks for enough CTAs (GB300, 32-token windows:
-                # BV=8 best up to batch 8, BV=32 from batch 16).
-                block_v=8 if num_spec_decodes <= 8 else 32,
+                block_v=64,
+                chunked=True,
+                dot_precision="tf32",
             )
         elif spec_sequence_masks is not None:
             core_attn_out_spec, last_recurrent_state = (
