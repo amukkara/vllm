@@ -240,6 +240,9 @@ def _gdn_recoverssm_chunk_verify_kernel(
     USE_LOWER_BOUND: tl.constexpr,
     HEADS_PER_QK_HEAD: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
+    INV_DOUBLING: tl.constexpr,
+    LOG2_BT: tl.constexpr,
+    INV_PRECISION: tl.constexpr,
 ):
     """GDN (scalar gate) verify of a whole window at once, in chunk form.
 
@@ -329,12 +332,23 @@ def _gdn_recoverssm_chunk_verify_kernel(
         * tl.dot(k_hat, tl.trans(k_hat), input_precision=DOT_PRECISION),
         0.0,
     )
-    # (I + A)^-1 by forward substitution: row i = e_i - A[i, :] @ inv.
-    inv = tl.where(offs_t[:, None] == offs_t[None, :], 1.0, 0.0)
-    for i in tl.static_range(1, BT):
-        a_row = tl.sum(tl.where(offs_t[:, None] == i, a_mat, 0.0), axis=0)
-        row = tl.sum(a_row[:, None] * inv, axis=0)
-        inv = tl.where(offs_t[:, None] == i, inv - row[None, :], inv)
+    eye = tl.where(offs_t[:, None] == offs_t[None, :], 1.0, 0.0)
+    if INV_DOUBLING:
+        # A is strictly lower triangular, so (-A)^BT = 0 and
+        # (I + A)^-1 = (I - A)(I + A^2)(I + A^4)...(I + A^(BT/2)) exactly:
+        # 2 log2(BT) - 2 small matmuls instead of a serial substitution.
+        power = -a_mat
+        inv = eye + power
+        for _ in tl.static_range(1, LOG2_BT):
+            power = tl.dot(power, power, input_precision=INV_PRECISION)
+            inv = inv + tl.dot(inv, power, input_precision=INV_PRECISION)
+    else:
+        # (I + A)^-1 by forward substitution: row i = e_i - A[i, :] @ inv.
+        inv = eye
+        for i in tl.static_range(1, BT):
+            a_row = tl.sum(tl.where(offs_t[:, None] == i, a_mat, 0.0), axis=0)
+            row = tl.sum(a_row[:, None] * inv, axis=0)
+            inv = tl.where(offs_t[:, None] == i, inv - row[None, :], inv)
 
     k_state = tl.dot(k_hat, tl.trans(state), input_precision=DOT_PRECISION)
     rhs = beta[:, None] * v - (beta * tl.exp(G))[:, None] * k_state
@@ -833,6 +847,10 @@ def kda_recoverssm_verify(
     block_v: int = 32,
     chunked: bool = False,
     dot_precision: str = "tf32",
+    inv_doubling: bool = False,
+    inv_precision: str = "tf32x3",
+    num_warps: int = 4,
+    num_stages: int = 1,
 ) -> torch.Tensor:
     """Verify a KDA speculative window without modifying its checkpoint.
 
@@ -939,8 +957,11 @@ def kda_recoverssm_verify(
         meta = dict(
             BT=block_t,
             DOT_PRECISION=dot_precision,
-            num_warps=4,
-            num_stages=1,
+            INV_DOUBLING=inv_doubling,
+            LOG2_BT=block_t.bit_length() - 1,
+            INV_PRECISION=inv_precision,
+            num_warps=num_warps,
+            num_stages=num_stages,
         )
     else:
         kernel = _kda_recoverssm_verify_kernel

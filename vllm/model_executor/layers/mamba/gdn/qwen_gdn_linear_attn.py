@@ -1500,6 +1500,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 block_v=64,
                 chunked=True,
                 dot_precision="tf32",
+                inv_doubling=True,
+                inv_precision="tf32",
             )
         elif spec_sequence_masks is not None:
             core_attn_out_spec, last_recurrent_state = (
