@@ -146,6 +146,13 @@ class Scheduler(SchedulerInterface):
         self.num_sampled_tokens_per_step = (
             1 if not vllm_config.model_config.is_diffusion else 0
         )
+        # Simulated block diffusion: a denoising step emits no tokens and
+        # rejects its whole window, including the AR bonus position.
+        spec_config = vllm_config.speculative_config
+        self.allow_empty_spec_steps = (
+            spec_config is not None
+            and spec_config.synthetic_denoise_steps is not None
+        )
 
         # Create KVConnector for the Scheduler. Note that each Worker
         # will have a corresponding KVConnector with Role=WORKER.
@@ -2053,12 +2060,16 @@ class Scheduler(SchedulerInterface):
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
             )
             if scheduled_spec_token_ids and (
-                generated_token_ids or self.num_sampled_tokens_per_step == 0
+                generated_token_ids
+                or self.num_sampled_tokens_per_step == 0
+                or self.allow_empty_spec_steps
             ):
                 num_draft_tokens = len(scheduled_spec_token_ids)
                 num_sampled = self.num_sampled_tokens_per_step
                 num_accepted = max(len(generated_token_ids) - num_sampled, 0)
                 num_rejected = num_draft_tokens - num_accepted
+                if not generated_token_ids and self.allow_empty_spec_steps:
+                    num_rejected += num_sampled
                 # Rejections roll back num_computed_tokens (and, under async
                 # scheduling, num_output_placeholders, which covers the spec
                 # tokens). A stale rejection count predates the preemption

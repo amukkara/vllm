@@ -549,6 +549,15 @@ class SpeculativeConfig:
     synthetic_acceptance_rates. Only valid when rejection_sample_method is 'synthetic'.
     Mutually exclusive with synthetic_acceptance_rates."""
 
+    synthetic_denoise_steps: int | None = None
+    """Simulate block-diffusion decoding with synthetic rejection sampling.
+    Each request runs this many denoising passes that emit no tokens (the
+    whole 1 + num_speculative_tokens window is rejected and its positions
+    are re-run), then one commit pass that accepts every draft token. The
+    draft model is skipped and the drafts are random token ids, so the
+    output is meaningless. Only valid when rejection_sample_method is
+    'synthetic'; the acceptance rates default to (and must be) all 1.0."""
+
     enable_adaptive_verification: bool = False
     """Whether to adaptively size the draft-verification budget from per-request
     confidence. Currently only supported for method="dspark"."""
@@ -1823,6 +1832,20 @@ class SpeculativeConfig:
                 f"than zero ({self.num_speculative_tokens})."
             )
 
+        if self.synthetic_denoise_steps is not None:
+            if self.rejection_sample_method != "synthetic":
+                raise ValueError(
+                    "synthetic_denoise_steps is only valid with "
+                    "rejection_sample_method='synthetic'."
+                )
+            if self.synthetic_denoise_steps < 0:
+                raise ValueError("synthetic_denoise_steps must be non-negative.")
+            if (
+                self.synthetic_acceptance_rates is None
+                and self.synthetic_acceptance_length is None
+            ):
+                # The commit pass accepts the whole window.
+                self.synthetic_acceptance_rates = [1.0] * self.num_speculative_tokens
         if self.rejection_sample_method == "synthetic":
             # Consolidate to per-position rates
             self.synthetic_acceptance_rates = self._resolve_synthetic_acceptance_rates(
@@ -1831,6 +1854,13 @@ class SpeculativeConfig:
                 self.synthetic_acceptance_length,
             )
             self.synthetic_acceptance_length = None
+            if self.synthetic_denoise_steps is not None and not all(
+                r == 1.0 for r in self.synthetic_acceptance_rates
+            ):
+                raise ValueError(
+                    "synthetic_denoise_steps needs all synthetic acceptance "
+                    "rates to be 1.0 (the commit pass accepts every draft)."
+                )
         elif (
             self.synthetic_acceptance_rates is not None
             or self.synthetic_acceptance_length is not None

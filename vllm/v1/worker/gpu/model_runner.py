@@ -2195,22 +2195,32 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.speculator.prepare_watermarking(
                     self.sampler, input_batch.idx_mapping
                 )
-            with use_workspace_lane(self._draft_workspace_lane):
-                draft_tokens = self.speculator.propose(
-                    input_batch,
-                    attn_metadata,
-                    slot_mappings_by_layer,
-                    spec_hidden_states,
-                    aux_hidden_states,
-                    num_sampled,
-                    num_rejected,
-                    self.req_states.last_sampled_tokens,
-                    self.req_states.next_prefill_tokens,
-                    self.sampler.sampling_states.temperature.gpu,
-                    self.sampler.sampling_states.seeds.gpu,
-                    dp_sync=dp_sync,
-                    mm_inputs=mm_inputs,
+            if self.speculative_config.synthetic_denoise_steps is not None:
+                # Simulated block diffusion: random canvas tokens and no
+                # draft-model forward.
+                draft_tokens = torch.randint(
+                    self.vocab_size,
+                    (input_batch.num_reqs, self.num_speculative_steps),
+                    dtype=self.req_states.draft_tokens.dtype,
+                    device=self.device,
                 )
+            else:
+                with use_workspace_lane(self._draft_workspace_lane):
+                    draft_tokens = self.speculator.propose(
+                        input_batch,
+                        attn_metadata,
+                        slot_mappings_by_layer,
+                        spec_hidden_states,
+                        aux_hidden_states,
+                        num_sampled,
+                        num_rejected,
+                        self.req_states.last_sampled_tokens,
+                        self.req_states.next_prefill_tokens,
+                        self.sampler.sampling_states.temperature.gpu,
+                        self.sampler.sampling_states.seeds.gpu,
+                        dp_sync=dp_sync,
+                        mm_inputs=mm_inputs,
+                    )
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
             if self.adaptive_verification is not None:
                 self.adaptive_verification.record_confidences(

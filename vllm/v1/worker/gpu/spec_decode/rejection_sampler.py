@@ -144,6 +144,38 @@ def gather_draft_sampled(
     return draft_sampled, pos
 
 
+@triton.jit
+def _synthetic_denoise_kernel(
+    num_sampled_ptr,
+    seq_lens_ptr,
+    cu_num_logits_ptr,
+    idx_mapping_ptr,
+    block_seq_len_ptr,  # [max_num_reqs] seq_len of the request's current block
+    denoise_step_ptr,  # [max_num_reqs] passes already run on that block
+    NUM_DENOISE_STEPS: tl.constexpr,
+):
+    batch_idx = tl.program_id(0)
+    req_state_idx = tl.load(idx_mapping_ptr + batch_idx)
+    if req_state_idx < 0:
+        return
+    num_logits = tl.load(cu_num_logits_ptr + batch_idx + 1) - tl.load(
+        cu_num_logits_ptr + batch_idx
+    )
+    if num_logits <= 1:
+        # Prefill or a non-speculative step: sample as usual.
+        return
+    # A denoising pass leaves the positions (so seq_len) unchanged; a new
+    # seq_len is a new block, either after a commit or for a new request.
+    seq_len = tl.load(seq_lens_ptr + batch_idx)
+    step = tl.load(denoise_step_ptr + req_state_idx) + 1
+    step = tl.where(tl.load(block_seq_len_ptr + req_state_idx) == seq_len, step, 0)
+    tl.store(block_seq_len_ptr + req_state_idx, seq_len)
+    tl.store(denoise_step_ptr + req_state_idx, step)
+    if step < NUM_DENOISE_STEPS:
+        # Emit nothing: the whole window is rejected and re-run next step.
+        tl.store(num_sampled_ptr + batch_idx, 0)
+
+
 class RejectionSampler:
     def __init__(
         self,
@@ -173,6 +205,17 @@ class RejectionSampler:
             )
         elif rejection_sample_method == "block":
             self.use_block_verification = True
+        # Simulated block diffusion: per request, N passes that emit nothing,
+        # then a commit pass that accepts the whole window.
+        self.synthetic_denoise_steps = spec_config.synthetic_denoise_steps
+        if self.synthetic_denoise_steps is not None:
+            max_num_reqs = sampler.req_states.prefill_len.gpu.shape[0]
+            self.block_seq_len = torch.full(
+                (max_num_reqs,), -1, dtype=torch.int32, device=device
+            )
+            self.denoise_step = torch.zeros(
+                max_num_reqs, dtype=torch.int32, device=device
+            )
 
     def _get_logprobs_tensors(
         self,
@@ -395,6 +438,17 @@ class RejectionSampler:
             chunk_logit_limit,
             max_num_logprobs,
         )
+
+        if self.synthetic_denoise_steps is not None:
+            _synthetic_denoise_kernel[(input_batch.num_reqs,)](
+                num_sampled,
+                input_batch.seq_lens,
+                input_batch.cu_num_logits,
+                input_batch.idx_mapping,
+                self.block_seq_len,
+                self.denoise_step,
+                NUM_DENOISE_STEPS=self.synthetic_denoise_steps,
+            )
 
         num_sampled, num_rejected = get_num_sampled_and_rejected(
             num_sampled,
