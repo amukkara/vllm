@@ -239,6 +239,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 [forward_context[layer_name] for layer_name in self.layer_names],
                 spec_query_len=1 + self.num_spec,
                 max_num_reqs=self.vllm_config.scheduler_config.max_num_seqs,
+                chunked_commit=True,
             )
         return self.recoverssm_context
 
@@ -870,6 +871,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 state_indices=[
                     b.spec_state_indices_tensor for b in builders for _ in b.layer_names
                 ],
+                chunked_commit=True,
             )
             cls._group_recoverssm_contexts[key] = context
         return context

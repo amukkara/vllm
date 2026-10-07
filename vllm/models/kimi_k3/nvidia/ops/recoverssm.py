@@ -603,6 +603,9 @@ def _commit_kda_state_kernel(
     USE_LOWER_BOUND: tl.constexpr,
     ALIGN_MODE: tl.constexpr,
     PER_LAYER_STATE_INDICES: tl.constexpr,
+    CHUNKED: tl.constexpr = False,
+    BT: tl.constexpr = 16,
+    DOT_PRECISION: tl.constexpr = "tf32x3",
 ):
     pid_v = tl.program_id(0)
     pid_b = tl.program_id(1)
@@ -682,54 +685,111 @@ def _commit_kda_state_kernel(
         mask=mask_k,
         other=0.0,
     ).to(tl.float32)
-    final_decay = tl.full([BK], 1.0, tl.float32)
-    final_correction = tl.zeros([BV, BK], tl.float32)
-    boundary_decay = tl.full([BK], 1.0, tl.float32)
-    boundary_correction = tl.zeros([BV, BK], tl.float32)
-
-    for reverse_offset in range(commit_len):
-        token_offset = commit_len - reverse_offset - 1
-        correction_ptr = (
-            correction_cache_ptr + token_offset * stride_correction_cache_pos
+    if CHUNKED:
+        # Parallel fold of the whole window. With G = cumsum(gate) over the
+        # committed tokens (inclusive), the serial replay below equals
+        #   S = exp(G_end) * S0 + C^T @ (k_hat * exp(G_end - G)),
+        # one [BV, BT] x [BT, BK] dot. The gate is <= 0, so the weights are
+        # in (0, 1]. Rows past the commit length have zero weight.
+        offs_t = tl.arange(0, BT)
+        mask_t = offs_t < commit_len
+        mask_tk = mask_t[:, None] & mask_k[None, :]
+        kg_ptrs = (
+            kg_cache_ptr
+            + offs_t[:, None] * stride_kg_cache_pos
+            + offs_k[None, :] * stride_kg_cache_dim
         )
-        kg_ptr = kg_cache_ptr + token_offset * stride_kg_cache_pos
-        k = tl.load(
-            kg_ptr + offs_k * stride_kg_cache_dim,
-            mask=mask_k,
-            other=0.0,
+        k = tl.load(kg_ptrs, mask=mask_tk, other=0.0).to(tl.float32)
+        raw_g = tl.load(
+            kg_ptrs + K * stride_kg_cache_dim, mask=mask_tk, other=0.0
         ).to(tl.float32)
         correction = tl.load(
-            correction_ptr + offs_v * stride_correction_cache_dim,
-            mask=mask_v,
+            correction_cache_ptr
+            + offs_t[:, None] * stride_correction_cache_pos
+            + offs_v[None, :] * stride_correction_cache_dim,
+            mask=mask_t[:, None] & mask_v[None, :],
             other=0.0,
         ).to(tl.float32)
-        raw_g = tl.load(
-            kg_ptr + (K + offs_k) * stride_kg_cache_dim,
-            mask=mask_k,
-            other=0.0,
-        ).to(tl.float32)
-        normalized_k = k * tl.rsqrt(tl.sum(k * k) + 1e-6)
-        gate = _kda_gate(
-            raw_g,
-            dt_bias,
-            A,
-            lower_bound,
-            USE_LOWER_BOUND,
+        normalized_k = k * tl.rsqrt(tl.sum(k * k, axis=1) + 1e-6)[:, None]
+        gate = tl.where(
+            mask_tk,
+            _kda_gate(raw_g, dt_bias[None, :], A, lower_bound, USE_LOWER_BOUND),
+            0.0,
         )
-        update = correction[:, None] * normalized_k[None, :]
-        decay = tl.exp(gate)
-        final_correction += update * final_decay[None, :]
-        final_decay *= decay
+        G = tl.cumsum(gate, axis=0)
+        G_end = tl.sum(gate, axis=0)
+        weighted_k = tl.where(
+            mask_t[:, None], normalized_k * tl.exp(G_end[None, :] - G), 0.0
+        )
+        state = initial_state * tl.exp(G_end)[None, :] + tl.dot(
+            tl.trans(correction), weighted_k, input_precision=DOT_PRECISION
+        )
         if ALIGN_MODE:
-            before_boundary = token_offset < boundary_recovery_len
-            boundary_correction += tl.where(
-                before_boundary,
-                update * boundary_decay[None, :],
+            before_boundary = offs_t < boundary_recovery_len
+            G_boundary = tl.sum(
+                tl.where(before_boundary[:, None], gate, 0.0), axis=0
+            )
+            boundary_k = tl.where(
+                before_boundary[:, None],
+                normalized_k * tl.exp(G_boundary[None, :] - G),
                 0.0,
             )
-            boundary_decay *= tl.where(before_boundary, decay, 1.0)
+            boundary_state = initial_state * tl.exp(G_boundary)[None, :] + tl.dot(
+                tl.trans(correction), boundary_k, input_precision=DOT_PRECISION
+            )
+    else:
+        final_decay = tl.full([BK], 1.0, tl.float32)
+        final_correction = tl.zeros([BV, BK], tl.float32)
+        boundary_decay = tl.full([BK], 1.0, tl.float32)
+        boundary_correction = tl.zeros([BV, BK], tl.float32)
 
-    state = initial_state * final_decay[None, :] + final_correction
+        for reverse_offset in range(commit_len):
+            token_offset = commit_len - reverse_offset - 1
+            correction_ptr = (
+                correction_cache_ptr + token_offset * stride_correction_cache_pos
+            )
+            kg_ptr = kg_cache_ptr + token_offset * stride_kg_cache_pos
+            k = tl.load(
+                kg_ptr + offs_k * stride_kg_cache_dim,
+                mask=mask_k,
+                other=0.0,
+            ).to(tl.float32)
+            correction = tl.load(
+                correction_ptr + offs_v * stride_correction_cache_dim,
+                mask=mask_v,
+                other=0.0,
+            ).to(tl.float32)
+            raw_g = tl.load(
+                kg_ptr + (K + offs_k) * stride_kg_cache_dim,
+                mask=mask_k,
+                other=0.0,
+            ).to(tl.float32)
+            normalized_k = k * tl.rsqrt(tl.sum(k * k) + 1e-6)
+            gate = _kda_gate(
+                raw_g,
+                dt_bias,
+                A,
+                lower_bound,
+                USE_LOWER_BOUND,
+            )
+            update = correction[:, None] * normalized_k[None, :]
+            decay = tl.exp(gate)
+            final_correction += update * final_decay[None, :]
+            final_decay *= decay
+            if ALIGN_MODE:
+                before_boundary = token_offset < boundary_recovery_len
+                boundary_correction += tl.where(
+                    before_boundary,
+                    update * boundary_decay[None, :],
+                    0.0,
+                )
+                boundary_decay *= tl.where(before_boundary, decay, 1.0)
+
+        state = initial_state * final_decay[None, :] + final_correction
+        if ALIGN_MODE:
+            boundary_state = (
+                initial_state * boundary_decay[None, :] + boundary_correction
+            )
     if ALIGN_MODE:
         boundary_ptrs = (
             state_ptr
@@ -738,7 +798,6 @@ def _commit_kda_state_kernel(
             + offs_v[:, None] * stride_state_v
             + offs_k[None, :] * stride_state_k
         )
-        boundary_state = initial_state * boundary_decay[None, :] + boundary_correction
         tl.store(
             boundary_ptrs,
             boundary_state,
@@ -967,6 +1026,9 @@ class KDARecoverSSMCommitContext:
     # groups with different block tables (GDN: one group per layer). The
     # state_indices passed to commit() then only select the batch rows.
     state_indices_addrs: torch.Tensor | None = None
+    # Fold the accepted tokens with one tensor-core dot per (layer, head,
+    # request) instead of a serial replay over the window.
+    chunked_commit: bool = False
 
     @classmethod
     def create(
@@ -976,6 +1038,7 @@ class KDARecoverSSMCommitContext:
         spec_query_len: int,
         max_num_reqs: int,
         state_indices: Sequence[torch.Tensor] | None = None,
+        chunked_commit: bool = False,
     ) -> "KDARecoverSSMCommitContext":
         if not layers:
             raise ValueError("KDA RecoverSSM commit requires at least one layer")
@@ -1122,6 +1185,7 @@ class KDARecoverSSMCommitContext:
             dt_bias=torch.stack(tuple(dt_bias)).contiguous(),
             lower_bound=lower_bounds.pop(),
             spec_query_len=spec_query_len,
+            chunked_commit=chunked_commit,
             state_indices_addrs=(
                 _base_addrs(state_indices) if state_indices is not None else None
             ),
@@ -1242,7 +1306,10 @@ class KDARecoverSSMCommitContext:
         state_ref = self.checkpoints[0]
         _, num_heads, value_dim, key_dim = state_ref.shape
         block_k = triton.next_power_of_2(key_dim)
-        block_v = min(triton.next_power_of_2(value_dim), 32)
+        # tl.dot needs every dimension >= 16.
+        block_v = min(
+            triton.next_power_of_2(value_dim), 64 if self.chunked_commit else 32
+        )
         grid = (
             triton.cdiv(value_dim, block_v),
             batch,
@@ -1290,6 +1357,8 @@ class KDARecoverSSMCommitContext:
             NUM_HEADS=num_heads,
             USE_LOWER_BOUND=self.lower_bound is not None,
             ALIGN_MODE=block_table is not None,
+            CHUNKED=self.chunked_commit,
+            BT=max(triton.next_power_of_2(self.spec_query_len), 16),
             num_warps=4,
             num_stages=2,
         )
