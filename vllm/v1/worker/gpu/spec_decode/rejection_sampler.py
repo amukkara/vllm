@@ -145,6 +145,66 @@ def gather_draft_sampled(
     return draft_sampled, pos
 
 
+@triton.jit
+def _top1_pack_kernel(values_ptr, indices_ptr, out_ptr, num_rows, vocab_start,
+                      BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < num_rows
+    values = tl.load(values_ptr + offs, mask=mask).to(tl.float32)
+    token_ids = tl.load(indices_ptr + offs, mask=mask) + vocab_start
+    tl.store(out_ptr + offs * 2, values, mask=mask)
+    tl.store(out_ptr + offs * 2 + 1, token_ids.to(tl.float32), mask=mask)
+
+
+def vocab_parallel_top1_pairs(
+    local_logits: torch.Tensor,
+    tp_rank: int,
+    tp_size: int,
+    vocab_size: int,
+    all_gather: Callable[[torch.Tensor], torch.Tensor],
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Every rank's greedy (logit, token id) pair per row of vocab-parallel
+    logits, for combine_top1_pairs or the diffusion pass kernel.
+
+    local_logits: [rows, vocab_per_rank], this rank's equal-size shard of the
+    padded vocab. all_gather concatenates [rows, 2] along dim 0 in rank order
+    (no reshuffle copy, unlike a last-dim gather). out: optional [>= rows, 2]
+    float32 buffer for this rank's pairs. Returns [tp_size * rows, 2] float32
+    (fp32 holds token ids exactly: vocab < 2**24), rank-major.
+    """
+    rows, shard = local_logits.shape
+    vocab_start = tp_rank * shard
+    num_valid = min(max(vocab_size - vocab_start, 0), shard)
+    if num_valid < shard:
+        # Vocab padding at the end of the last shard(s) is not a token.
+        local_logits = local_logits.clone()
+        local_logits[:, num_valid:] = float("-inf")
+    values, indices = local_logits.max(dim=-1)
+    if out is None:
+        out = torch.empty(rows, 2, dtype=torch.float32, device=local_logits.device)
+    pairs = out[:rows]
+    block = 1024
+    _top1_pack_kernel[(triton.cdiv(rows, block),)](
+        values, indices, pairs, rows, vocab_start, BLOCK=block
+    )
+    return pairs if tp_size == 1 else all_gather(pairs)
+
+
+def combine_top1_pairs(
+    pairs: torch.Tensor, tp_size: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Greedy token and its logit per row from vocab_parallel_top1_pairs.
+
+    Same result as argmax / max over the full-vocab logits: the first rank
+    holding the max wins, i.e. the lowest token id. Returns (token ids [rows]
+    int64, logits [rows] float32)."""
+    pairs = pairs.view(tp_size, -1, 2)
+    best_rank = pairs[:, :, 0].argmax(dim=0, keepdim=True)
+    best = pairs.gather(0, best_rank.unsqueeze(-1).expand(1, -1, 2)).squeeze(0)
+    return best[:, 1].to(torch.int64), best[:, 0]
+
+
 def vocab_parallel_top1(
     local_logits: torch.Tensor,
     tp_rank: int,
@@ -154,33 +214,31 @@ def vocab_parallel_top1(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Greedy token and its logit per row from vocab-parallel logits.
 
-    Same result as argmax / max over the all-gathered full-vocab logits (ties
-    go to the lowest token id), but each rank reduces its own shard and only
-    one (logit, token id) pair per row and rank is gathered.
-
-    local_logits: [rows, vocab_per_rank], this rank's equal-size shard of the
-    padded vocab. all_gather concatenates [rows, 2] along the last dim in
-    rank order. Returns (token ids [rows] int64, logits [rows] float32).
+    Same result as argmax / max over the all-gathered full-vocab logits, but
+    each rank reduces its own shard and only one (logit, token id) pair per
+    row and rank is gathered (all_gather: as in vocab_parallel_top1_pairs).
     """
-    shard = local_logits.shape[-1]
-    vocab_start = tp_rank * shard
-    num_valid = min(max(vocab_size - vocab_start, 0), shard)
-    if num_valid < shard:
-        # Vocab padding at the end of the last shard(s) is not a token.
-        local_logits = local_logits.clone()
-        local_logits[:, num_valid:] = float("-inf")
-    values, indices = local_logits.max(dim=-1)
-    values = values.float()
-    token_ids = indices + vocab_start
-    if tp_size == 1:
-        return token_ids, values
-    # fp32 holds token ids exactly (vocab < 2**24). The first rank holding
-    # the max wins, i.e. the lowest token id, as argmax over the full row.
-    pairs = all_gather(torch.stack([values, token_ids.float()], dim=-1))
-    pairs = pairs.view(-1, tp_size, 2)
-    best_rank = pairs[:, :, 0].argmax(dim=-1, keepdim=True)
-    best = pairs.gather(1, best_rank.unsqueeze(-1).expand(-1, 1, 2)).squeeze(1)
-    return best[:, 1].to(torch.int64), best[:, 0]
+    return combine_top1_pairs(
+        vocab_parallel_top1_pairs(
+            local_logits, tp_rank, tp_size, vocab_size, all_gather
+        ),
+        tp_size,
+    )
+
+
+@triton.jit
+def _load_top1(pairs_ptr, rank_stride, rows, mask, NUM_RANKS: tl.constexpr):
+    # Best (token id, logit) per row over the ranks' pairs (rank-major,
+    # rank_stride rows apart); the first rank holding the max wins.
+    best = tl.load(pairs_ptr + rows * 2, mask=mask, other=float("-inf"))
+    token = tl.load(pairs_ptr + rows * 2 + 1, mask=mask, other=0.0)
+    for r in tl.static_range(1, NUM_RANKS):
+        ptrs = pairs_ptr + (r * rank_stride + rows) * 2
+        value = tl.load(ptrs, mask=mask, other=float("-inf"))
+        better = value > best
+        best = tl.where(better, value, best)
+        token = tl.where(better, tl.load(ptrs + 1, mask=mask, other=0.0), token)
+    return token.to(tl.int64), best
 
 
 # Simulated block diffusion (synthetic_denoise_steps): per-request phase.
@@ -202,8 +260,8 @@ def _diffusion_random_tokens(seed, req_state_idx, seq_len, num_passes, offs, voc
 
 @triton.jit
 def _diffusion_pass_kernel(
-    top_tokens_ptr,  # [num_logits] greedy token per logits row
-    top_logits_ptr,  # [num_logits] its logit: the confidence
+    top_pairs_ptr,  # [NUM_RANKS * rank_stride, 2] per-rank (logit, token id)
+    rank_stride,  # logits rows
     cu_num_logits_ptr,
     idx_mapping_ptr,
     seq_lens_ptr,
@@ -229,8 +287,12 @@ def _diffusion_pass_kernel(
     NUM_DENOISE_STEPS: tl.constexpr,
     USE_THRESHOLD: tl.constexpr,
     WRITE_INPUT_IDS: tl.constexpr,
+    NUM_RANKS: tl.constexpr,
 ):
     """One pass of the simulated block-diffusion decoder, per batch row.
+
+    Each logits row's greedy token and its logit (the confidence) is the best
+    of the TP ranks' top-1 pairs (vocab_parallel_top1_pairs).
 
     The window is [last committed token, canvas[0 : W - 1]] at positions
     L .. L + W - 1, and its logits rows predict canvas[0 : W] (positions
@@ -262,7 +324,10 @@ def _diffusion_pass_kernel(
         num_sampled = tl.where(
             seq_len < tl.load(prefill_len_ptr + req_state_idx), 0, 1
         )
-        tl.store(sampled_ptr + batch_idx * sampled_stride, tl.load(top_tokens_ptr + start))
+        token, _ = _load_top1(
+            top_pairs_ptr, rank_stride, start, start >= 0, NUM_RANKS
+        )
+        tl.store(sampled_ptr + batch_idx * sampled_stride, token)
         tl.store(num_sampled_ptr + batch_idx, num_sampled)
         tl.store(num_rejected_ptr + batch_idx, 0)
         tl.store(block_seq_len_ptr + req_state_idx, -1)
@@ -301,8 +366,9 @@ def _diffusion_pass_kernel(
     num_passes = tl.load(num_passes_ptr + req_state_idx)
     num_passes = tl.where(new_block, 0, num_passes) + 1
     final = tl.where(new_block, 0, tl.load(finalized_ptrs)) != 0
-    tokens = tl.load(top_tokens_ptr + start + offs, mask=valid, other=0)
-    conf = tl.load(top_logits_ptr + start + offs, mask=valid, other=0.0)
+    tokens, conf = _load_top1(
+        top_pairs_ptr, rank_stride, start + offs, valid, NUM_RANKS
+    )
     final = final & valid
     open_ = ~final & valid
     conf = tl.where(open_, conf, float("-inf"))
@@ -472,6 +538,11 @@ class RejectionSampler:
                 max_num_reqs, window, dtype=torch.int32, device=device
             )
             self.denoise_flags = _DiffusionFlags(max_num_reqs)
+            # This rank's top-1 pairs (vocab_parallel_top1_pairs), at most a
+            # window of logits rows per request.
+            self.denoise_top1 = torch.empty(
+                max_num_reqs * window, 2, dtype=torch.float32, device=device
+            )
             # Outputs of the runner loop's non-final passes, which emit
             # nothing and are never copied out (the final pass allocates).
             self._denoise_scratch = (
@@ -499,8 +570,8 @@ class RejectionSampler:
 
     def sample_denoise_pass(
         self,
-        top_tokens: torch.Tensor,
-        top_logits: torch.Tensor,
+        top_pairs: torch.Tensor,
+        num_ranks: int,
         input_batch: InputBatch,
         draft_tokens: torch.Tensor,
         vocab_size: int,
@@ -509,12 +580,14 @@ class RejectionSampler:
     ) -> tuple[SamplerOutput, tuple[int, int]]:
         """One simulated block-diffusion pass (synthetic_denoise_steps), greedy.
 
-        top_tokens / top_logits: the greedy token and its logit (the
-        confidence) for every logits row. Denoising passes emit nothing and
-        update the canvas; a commit pass emits the canvas. Writes the next
-        pass's window inputs into draft_tokens (and, with write_input_ids,
-        into input_batch.input_ids) and the "next pass commits" flags; returns
-        their denoise_flags handle. No host synchronization.
+        top_pairs: [num_ranks * logits rows, 2] the TP ranks' top-1 (logit,
+        token id) pairs (vocab_parallel_top1_pairs); the kernel picks each
+        row's greedy token and its logit (the confidence). Denoising passes
+        emit nothing and update the canvas; a commit pass emits the canvas.
+        Writes the next pass's window inputs into draft_tokens (and, with
+        write_input_ids, into input_batch.input_ids) and the "next pass
+        commits" flags; returns their denoise_flags handle. No host
+        synchronization.
 
         emit=False: the caller knows no row commits or samples in this pass
         (a non-final pass of the runner loop) and discards the output, so it
@@ -524,10 +597,9 @@ class RejectionSampler:
         num_reqs = input_batch.num_reqs
         window = self.num_speculative_steps + 1
         if emit:
-            sampled = top_tokens.new_zeros(num_reqs, window)
-            num_sampled = torch.empty(
-                num_reqs, dtype=torch.int32, device=top_tokens.device
-            )
+            device = top_pairs.device
+            sampled = torch.zeros(num_reqs, window, dtype=torch.int64, device=device)
+            num_sampled = torch.empty(num_reqs, dtype=torch.int32, device=device)
             num_rejected = torch.empty_like(num_sampled)
         else:
             sampled, num_sampled, num_rejected = (
@@ -535,8 +607,8 @@ class RejectionSampler:
             )
         flags = self.denoise_flags
         _diffusion_pass_kernel[(num_reqs,)](
-            top_tokens,
-            top_logits,
+            top_pairs,
+            top_pairs.shape[0] // num_ranks,
             input_batch.cu_num_logits,
             input_batch.idx_mapping,
             input_batch.seq_lens,
@@ -562,6 +634,7 @@ class RejectionSampler:
             NUM_DENOISE_STEPS=self.synthetic_denoise_steps,
             USE_THRESHOLD=self.denoise_threshold is not None,
             WRITE_INPUT_IDS=write_input_ids,
+            NUM_RANKS=num_ranks,
         )
         output = SamplerOutput(
             sampled_token_ids=sampled,

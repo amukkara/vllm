@@ -166,7 +166,7 @@ from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
 )
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
     RejectionSampler,
-    vocab_parallel_top1,
+    vocab_parallel_top1_pairs,
     get_max_chunk_logits,
 )
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
@@ -1742,19 +1742,29 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         tp_rank = get_tensor_model_parallel_rank()
         tp_size = get_tensor_model_parallel_world_size()
 
+        # Every token of a loop step is a logits row (full windows, no
+        # prefill): skip the gather.
+        all_logits = loop_state is not None
+
         def run_pass(
             hidden: torch.Tensor, write_input_ids: bool, emit: bool = True
         ) -> tuple[SamplerOutput, Any]:
-            top_tokens, top_logits = vocab_parallel_top1(
-                self.model.compute_logits_local(hidden[input_batch.logits_indices]),
+            hidden = (
+                hidden[: input_batch.num_tokens]
+                if all_logits
+                else hidden[input_batch.logits_indices]
+            )
+            top_pairs = vocab_parallel_top1_pairs(
+                self.model.compute_logits_local(hidden),
                 tp_rank,
                 tp_size,
                 self.vocab_size,
-                lambda t: tensor_model_parallel_all_gather(t, dim=-1),
+                lambda t: tensor_model_parallel_all_gather(t, dim=0),
+                out=rs.denoise_top1,
             )
             return rs.sample_denoise_pass(
-                top_tokens,
-                top_logits,
+                top_pairs,
+                tp_size,
                 input_batch,
                 self.req_states.draft_tokens,
                 self.vocab_size,
