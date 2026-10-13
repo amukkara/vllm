@@ -18,6 +18,7 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import os
 import time
 from contextlib import AbstractContextManager
 from copy import deepcopy
@@ -345,6 +346,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # For transferring state from execute_model to subsequent sample_tokens call.
         self.execute_model_state: ExecuteModelState | None = None
+        # Simulated block diffusion: the step's decode graph, the handle of
+        # its first pass's "commits" flags and the graph's inputs_embeds buffer
+        # (None if it embeds input_ids itself), when the denoising passes may
+        # loop in the runner (see _sample_denoise).
+        self._denoise_loop_state: (
+            tuple[BatchExecutionDescriptor, Any, torch.Tensor | None] | None
+        ) = None
+        # Debug: log every diffusion step's passes (VLLM_DENOISE_DEBUG=1).
+        self._denoise_debug = os.environ.get("VLLM_DENOISE_DEBUG") == "1"
+        # Whether this step's sample() wrote the next window inputs.
+        self._denoise_drafts_written = False
 
         # Expert parallelism load balancer.
         self.eplb = EPLBController(self.parallel_config, self.device)
@@ -496,6 +508,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     watermark_key=speculative_target_watermark_key(
                         self.vllm_config.watermark_config
                     ),
+                    seed=self.model_config.seed,
                 )
             self.prompt_logprobs_worker = PromptLogprobsWorker(
                 self.max_num_reqs,
@@ -1564,6 +1577,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         input_batch: InputBatch,
         grammar_output: GrammarOutput | None,
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
+        self._denoise_drafts_written = False
         if (
             self.speculative_config is not None
             and self.speculative_config.synthetic_denoise_steps is not None
@@ -1573,21 +1587,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             and grammar_output is None
             and self.batch_sharder is None
         ):
-            # Simulated block diffusion, greedy: reduce each vocab shard to
-            # its top-1 token and logit instead of gathering full-vocab logits.
-            assert self.rejection_sampler is not None
-            top_tokens, top_logits = vocab_parallel_top1(
-                self.model.compute_logits_local(
-                    hidden_states[input_batch.logits_indices]
-                ),
-                get_tensor_model_parallel_rank(),
-                get_tensor_model_parallel_world_size(),
-                self.vocab_size,
-                lambda t: tensor_model_parallel_all_gather(t, dim=-1),
-            )
-            sampler_output = self.rejection_sampler.sample_greedy_top1(
-                top_tokens, top_logits, input_batch
-            )
+            sampler_output = self._sample_denoise(hidden_states, input_batch)
+            self._denoise_drafts_written = True
             return (
                 sampler_output,
                 sampler_output.num_sampled,
@@ -1667,6 +1668,137 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         assert sampler_output is not None
         return sampler_output, sampler_output.num_sampled, sampler_output.num_rejected
+
+    def _can_loop_denoise(
+        self, input_batch: InputBatch, batch_desc: BatchExecutionDescriptor
+    ) -> bool:
+        """Whether this step's denoising passes may loop in the runner: a
+        decode-only batch replayed as one FULL CUDA graph, and nothing
+        (PP/DP/ubatching/KV connector/LoRA/sharded sampling) that expects one
+        forward per step."""
+        spec_config = self.speculative_config
+        return (
+            spec_config is not None
+            and spec_config.synthetic_denoise_steps is not None
+            and spec_config.synthetic_denoise_loop
+            and batch_desc.cg_mode == CUDAGraphMode.FULL
+            and batch_desc.num_ubatches == 1
+            and not input_batch.has_prefill
+            and input_batch.num_draft_tokens
+            == input_batch.num_reqs * self.num_speculative_steps
+            and self.pp_handler is None
+            and self.dp_size == 1
+            and self.pcp_manager is None
+            and self.batch_sharder is None
+            and self.lora_config is None
+            and self.kv_connector is NO_OP_KV_CONNECTOR
+            and not self.model_config.enable_prompt_embeds
+        )
+
+    def _log_denoise_step(
+        self,
+        input_batch: InputBatch,
+        batch_desc: BatchExecutionDescriptor,
+        num_passes: int | None,
+        reason: str,
+    ) -> None:
+        if get_tensor_model_parallel_rank() != 0:
+            return
+        logger.info(
+            "denoise step: reqs=%d tokens=%d drafts=%d prefill=%s cg=%s "
+            "ubatches=%d passes=%s %s",
+            input_batch.num_reqs,
+            input_batch.num_tokens,
+            input_batch.num_draft_tokens,
+            input_batch.has_prefill,
+            batch_desc.cg_mode,
+            batch_desc.num_ubatches,
+            num_passes,
+            reason,
+        )
+
+    def _sample_denoise(
+        self, hidden_states: torch.Tensor, input_batch: InputBatch
+    ) -> SamplerOutput:
+        """Simulated block diffusion (synthetic_denoise_steps), greedy.
+
+        Each pass reduces every vocab shard to its top-1 token and logit (no
+        full-vocab gather) and runs the diffusion pass kernel. When the step
+        may loop (_can_loop_denoise), the kernel also writes the next window
+        inputs into the decode graph's input ids and the graph is replayed
+        here, with unchanged positions and metadata, until a pass commits
+        some request (the scheduler must then advance it) or a block's worth
+        of passes ran. Loop control needs one host read per pass: whether the
+        pass whose forward was just queued commits any request. The previous
+        pass's kernel (or a kernel ahead of this step's forward) writes those
+        flags straight into pinned host memory, so the host waits on them
+        only while that forward runs: the GPU never idles, and nothing is
+        copied. Knowing whether a pass is the step's last before queueing its
+        sampling, the non-final passes write to scratch buffers.
+        """
+        rs = self.rejection_sampler
+        assert rs is not None
+        loop_state, self._denoise_loop_state = self._denoise_loop_state, None
+        tp_rank = get_tensor_model_parallel_rank()
+        tp_size = get_tensor_model_parallel_world_size()
+
+        def run_pass(
+            hidden: torch.Tensor, write_input_ids: bool, emit: bool = True
+        ) -> tuple[SamplerOutput, Any]:
+            top_tokens, top_logits = vocab_parallel_top1(
+                self.model.compute_logits_local(hidden[input_batch.logits_indices]),
+                tp_rank,
+                tp_size,
+                self.vocab_size,
+                lambda t: tensor_model_parallel_all_gather(t, dim=-1),
+            )
+            return rs.sample_denoise_pass(
+                top_tokens,
+                top_logits,
+                input_batch,
+                self.req_states.draft_tokens,
+                self.vocab_size,
+                write_input_ids=write_input_ids,
+                emit=emit,
+            )
+
+        if loop_state is None:
+            return run_pass(hidden_states, write_input_ids=False)[0]
+        batch_desc, commits, inputs_embeds = loop_state
+        assert self.cudagraph_manager is not None
+        num_tokens = input_batch.num_tokens
+        num_passes = 1
+        while True:
+            # The pass commits some request (or the cap is reached): it ends
+            # the step.
+            capped = num_passes >= rs.max_block_passes
+            last = capped or rs.denoise_flags.any(commits)
+            sampler_output, commits = run_pass(
+                hidden_states, write_input_ids=True, emit=last
+            )
+            if last:
+                if self._denoise_debug:
+                    self._log_denoise_step(
+                        input_batch,
+                        batch_desc,
+                        num_passes,
+                        "cap" if capped else "commit",
+                    )
+                return sampler_output
+            if inputs_embeds is not None:
+                # The graph reads embeddings (multimodal models): embed the
+                # new window inputs into its buffer. Decode windows hold no
+                # multimodal placeholders.
+                inputs_embeds[:num_tokens].copy_(
+                    self.model.embed_input_ids(input_batch.input_ids[:num_tokens])
+                )
+            model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
+            hidden_states = (
+                model_output[0]
+                if self.use_aux_hidden_state_outputs
+                else model_output
+            )
+            num_passes += 1
 
     def postprocess_sampled(
         self,
@@ -1987,6 +2119,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_tokens=input_batch.num_tokens,
         )
 
+        self._denoise_loop_state = None
+        if not dummy_run and self._can_loop_denoise(input_batch, batch_desc):
+            # Queued ahead of the forward, so reading it in _sample_denoise
+            # waits only for work that precedes this step's forward.
+            assert self.rejection_sampler is not None
+            self._denoise_loop_state = (
+                batch_desc,
+                self.rejection_sampler.denoise_commit_next(input_batch),
+                inputs_embeds,
+            )
+        elif self._denoise_debug and not dummy_run:
+            self._log_denoise_step(input_batch, batch_desc, None, "no loop")
+
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
@@ -2233,13 +2378,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.sampler, input_batch.idx_mapping
                 )
             if self.speculative_config.synthetic_denoise_steps is not None:
-                # Simulated block diffusion: random canvas tokens and no
-                # draft-model forward.
-                draft_tokens = torch.randint(
-                    self.vocab_size,
-                    (input_batch.num_reqs, self.num_speculative_steps),
-                    dtype=self.req_states.draft_tokens.dtype,
-                    device=self.device,
+                # Simulated block diffusion: no draft-model forward. The
+                # diffusion pass kernel already wrote the next window inputs
+                # into req_states.draft_tokens (random canvas tokens on the
+                # rare regular-sampler path, e.g. the structured-output warmup).
+                draft_tokens = (
+                    None
+                    if self._denoise_drafts_written
+                    else torch.randint(
+                        self.vocab_size,
+                        (input_batch.num_reqs, self.num_speculative_steps),
+                        dtype=self.req_states.draft_tokens.dtype,
+                        device=self.device,
+                    )
                 )
             else:
                 with use_workspace_lane(self._draft_workspace_lane):
@@ -2258,7 +2409,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         dp_sync=dp_sync,
                         mm_inputs=mm_inputs,
                     )
-            self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+            if draft_tokens is not None:
+                self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
             if self.adaptive_verification is not None:
                 self.adaptive_verification.record_confidences(
                     self.speculator.draft_token_confidence_probs, input_batch

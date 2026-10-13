@@ -551,12 +551,29 @@ class SpeculativeConfig:
 
     synthetic_denoise_steps: int | None = None
     """Simulate block-diffusion decoding with synthetic rejection sampling.
-    Each request runs this many denoising passes that emit no tokens (the
-    whole 1 + num_speculative_tokens window is rejected and its positions
-    are re-run), then one commit pass that accepts every draft token. The
-    draft model is skipped and the drafts are random token ids, so the
-    output is meaningless. Only valid when rejection_sample_method is
-    'synthetic'; the acceptance rates default to (and must be) all 1.0."""
+    Each request decodes blocks of 1 + num_speculative_tokens tokens over a
+    canvas: every denoising pass re-runs the block's window and emits no
+    tokens, and finalizes canvas positions by greedy confidence (the top-1
+    logit); the window's not-yet-final positions are random tokens. Once the
+    whole canvas is final, one commit pass runs it and accepts every token.
+    With the default schedule, pass p finalizes the most confident positions
+    up to ceil(window * p / synthetic_denoise_steps) in total, so a block
+    takes synthetic_denoise_steps denoising passes plus the commit pass. The
+    draft model is skipped and the output is meaningless. Only valid when
+    rejection_sample_method is 'synthetic'; the acceptance rates default to
+    (and must be) all 1.0."""
+
+    synthetic_denoise_threshold: float | None = None
+    """With synthetic_denoise_steps: instead of the fixed schedule, each
+    denoising pass finalizes every position whose top-1 logit is at least
+    this value (and at least the most confident one), so the number of
+    passes per block varies by request."""
+
+    synthetic_denoise_loop: bool = True
+    """With synthetic_denoise_steps: run the denoising passes in a loop inside
+    the model runner, replaying the decode CUDA graph without going back to
+    the scheduler, until some request reaches its commit pass. False runs
+    one pass per scheduler step (the same per-request results)."""
 
     enable_adaptive_verification: bool = False
     """Whether to adaptively size the draft-verification budget from per-request
@@ -1838,14 +1855,18 @@ class SpeculativeConfig:
                     "synthetic_denoise_steps is only valid with "
                     "rejection_sample_method='synthetic'."
                 )
-            if self.synthetic_denoise_steps < 0:
-                raise ValueError("synthetic_denoise_steps must be non-negative.")
+            if self.synthetic_denoise_steps < 1:
+                raise ValueError("synthetic_denoise_steps must be at least 1.")
             if (
                 self.synthetic_acceptance_rates is None
                 and self.synthetic_acceptance_length is None
             ):
                 # The commit pass accepts the whole window.
                 self.synthetic_acceptance_rates = [1.0] * self.num_speculative_tokens
+        elif self.synthetic_denoise_threshold is not None:
+            raise ValueError(
+                "synthetic_denoise_threshold needs synthetic_denoise_steps."
+            )
         if self.rejection_sample_method == "synthetic":
             # Consolidate to per-position rates
             self.synthetic_acceptance_rates = self._resolve_synthetic_acceptance_rates(
